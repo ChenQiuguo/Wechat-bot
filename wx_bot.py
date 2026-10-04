@@ -50,8 +50,15 @@ KEY_PATHS = [
 
 # 这些跳过原因很常见，静默处理，避免刷屏
 QUIET_REASONS = {
-    "自己发的", "系统会话", "群里没@我", "私聊未开启", "群聊未开启",
+    "自己发的", "系统会话", "群里没@我", "私聊未开启", "群聊未开启", "系统消息",
 }
+
+# 微信的系统提示（不是人说的话），不该回复
+SYSTEM_TEXTS = (
+    "我通过了你的朋友验证请求", "以上是打招呼的内容", "你已添加了", "对方开启了朋友验证",
+    "开启了朋友验证", "撤回了一条消息", "邀请你加入了群聊", "移出了群聊",
+    "该消息类型暂不能展示", "你已成功加入", "群主已开启", "你已被移出",
+)
 
 
 # --------------------------------------------------------------------------
@@ -242,6 +249,10 @@ class ReplyPolicy:
             return False, "系统会话"
         if payload["chat_name"] in self.skip_names:
             return False, "系统会话"
+        # 微信的系统提示（好友验证通过、打招呼内容等）不是人说的话，别回
+        content = (payload.get("content") or "").strip()
+        if len(content) <= 60 and any(t in content for t in SYSTEM_TEXTS):
+            return False, "系统消息"
         if payload["type"] not in self.trig.get("types", ["文本"]):
             return False, f"非文本({payload['type']})"
 
