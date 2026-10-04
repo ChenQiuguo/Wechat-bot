@@ -19,6 +19,15 @@
       "max_tokens": 16,
       "timeout": 12
     },
+    "image": {
+      "enabled": false,
+      "detail": "low",
+      "max_bytes": 8388608,
+      "save_dir": "",
+      "private_require_recent": false,
+      "recent_window_seconds": 1800,
+      "group_recent_seconds": 0
+    },
     "multi_send": {
       "enabled": true,
       "mode": "sentence",
@@ -36,7 +45,8 @@
     "context_judge": true,
     "context_lookback": 8,
     "judge_cooldown": 8,
-    "types": ["文本"],
+    "types": ["文本", "图片"],
+    "group_image": false,
     "max_age_seconds": 120
   },
   "limits": {

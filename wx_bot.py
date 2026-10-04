@@ -38,6 +38,7 @@ from wechatauto.db import WeChatDB, Listener
 from wechatauto.uia_driver import SESSION_LIST_AIDS, _aid_hit, _find_by
 import kb_input
 import memory_store
+import image_in
 from wx_push import SenderResolver, build_payload, clean_content, fmt_time, _as_text
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +55,7 @@ KEY_PATHS = [
 # 这些跳过原因很常见，静默处理，避免刷屏
 QUIET_REASONS = {
     "自己发的", "系统会话", "群里没@我", "私聊未开启", "群聊未开启", "系统消息",
+    "群里图片不回", "图片理解未开启", "图片取不到(本机无缓存)",
 }
 
 # 微信的系统提示（不是人说的话），不该回复
@@ -73,35 +75,59 @@ def load_config(path: str) -> dict:
         return json.load(f)
 
 
-def _pid_alive(pid: int) -> bool:
+def _pid_alive(pid: int, started: float = 0.0) -> bool:
+    """这个 pid 是不是**我们那个**进程。
+
+    只看 pid 会被**复用**骗到：机器人挂掉后 Windows 可能把同一个 pid 分给微信
+    或别的程序，残留锁就看起来「还在运行」，于是机器人再也起不来。
+    所以锁里额外记进程启动时间，对不上就当陈旧锁。
+    """
     try:
         import psutil
-        return psutil.pid_exists(pid)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
+    if not psutil.pid_exists(pid):
+        return False
+    if not started:
+        return True
+    try:
+        return abs(psutil.Process(pid).create_time() - float(started)) < 2.0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _self_start_time() -> float:
+    try:
+        import psutil
+        return psutil.Process(os.getpid()).create_time()
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def acquire_single_instance_lock():
     """保证同时只跑一个实例（两个进程会抢解密缓存，第二个必然报错）。
 
     返回 True 表示拿到锁；False 表示已有实例在跑。
+    锁内容为 ``"<pid> <进程启动时间>"``。
     """
     for _ in range(2):
         try:
             fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-            os.write(fd, str(os.getpid()).encode())
+            os.write(fd, f"{os.getpid()} {_self_start_time()}".encode())
             os.close(fd)
             return True
         except FileExistsError:
-            old = 0
+            old_pid, old_start = 0, 0.0
             try:
                 with open(LOCK_FILE, encoding="utf-8") as f:
-                    old = int((f.read() or "0").strip() or 0)
-            except Exception:
-                old = 0
-            if old and _pid_alive(old):
+                    parts = (f.read() or "").split()
+                old_pid = int(parts[0]) if parts else 0
+                old_start = float(parts[1]) if len(parts) > 1 else 0.0
+            except Exception:  # noqa: BLE001
+                old_pid, old_start = 0, 0.0
+            if old_pid and _pid_alive(old_pid, old_start):
                 return False
-            try:                       # 陈旧锁（上次异常退出留下的）→ 清掉重试
+            try:                       # 陈旧锁（上次异常退出 / pid 被复用）→ 清掉重试
                 os.remove(LOCK_FILE)
             except OSError:
                 return False
@@ -147,7 +173,11 @@ def load_api_key() -> str:
 
 def build_history(db: WeChatDB, resolver: "SenderResolver", chat_username: str,
                   limit: int = 8, exclude_local_id=None) -> list:
-    """取该会话最近若干条消息作为上下文（跳过媒体占位，排除当前这条）。"""
+    """取该会话最近若干条消息作为上下文。
+
+    纯文本才喂给模型；媒体消息只留一个占位说明（图片的具体内容只喂当前这条，
+    不然历史里每张图都要解密 + 上千 token）。
+    """
     try:
         msgs = db.get_messages(chat_username, limit=limit + 2)
     except Exception:
@@ -160,25 +190,43 @@ def build_history(db: WeChatDB, resolver: "SenderResolver", chat_username: str,
             is_self, _wxid, name = resolver.resolve(m)
         except Exception:
             is_self, name = False, "未知"
-        text = clean_content(_as_text(m.get("content")), m.get("type", ""))
+        mtype = m.get("type", "")
+        text = clean_content(_as_text(m.get("content")), mtype)
+        who = "我" if is_self else name
         if not text or text.startswith("["):
-            continue  # 媒体消息只占位，对理解语境没帮助
-        lines.append(f"{'我' if is_self else name}: {text}")
+            if mtype:
+                lines.append(f"{who}: [发了一张图片]" if mtype == "图片"
+                             else f"{who}: [{mtype}]")
+            continue
+        lines.append(f"{who}: {text}")
     return lines[-limit:]
 
 
 def _chat_call(cfg: dict, system_prompt: str, user_prompt: str, *, thinking: bool,
                max_tokens: int, timeout: float, temperature: float = 1.2,
-               reasoning_effort: str = "high", api_key: str = "") -> str:
-    """调一次 chat/completions，返回正文（失败返回空串）。"""
+               reasoning_effort: str = "high", api_key: str = "",
+               images=None) -> str:
+    """调一次 chat/completions，返回正文（失败返回空串）。
+
+    ``images`` 非空时走视觉输入：user 消息的 content 变成内容块数组，
+    图片按 base64 data URL 内联（官方限制：单图 ≤32MiB、请求体 ≤48MiB，
+    **图片只能放在 user 消息里**，system 里带图会 400）。
+    """
     key = api_key or load_api_key()
     if not key:
         return ""
+    user_content = user_prompt
+    if images:
+        blocks = [{"type": "text", "text": user_prompt}]
+        for data, mime in images:
+            blocks.append(image_in.image_block(data, mime,
+                                               cfg.get("image", {}).get("detail", "low")))
+        user_content = blocks
     body = {
         "model": cfg["model"],
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": user_content},
         ],
         "max_tokens": max_tokens,
         "stream": False,
@@ -224,8 +272,9 @@ def _with_key(ai_cfg: dict, api_key: str) -> dict:
 
 def ai_reply(cfg: dict, content: str, sender: str, chat_name: str, is_group: bool,
              history=None, me_name: str = "", mem_block: str = "",
-             api_key: str = "") -> str:
+             api_key: str = "", images=None) -> str:
     api_key = api_key or cfg.get("_api_key", "")
+
     who = f"{sender}（在群「{chat_name}」里）" if is_group else sender
 
     ident = ""
@@ -236,11 +285,17 @@ def ai_reply(cfg: dict, content: str, sender: str, chat_name: str, is_group: boo
     ctx = ""
     if history:
         ctx = "最近的聊天记录（最后一条就是刚收到的）：\n" + "\n".join(history) + "\n\n"
+
     parts = [ident]
     if mem_block:
         parts.append(mem_block.strip() + "\n\n")
     parts.append(ctx)
-    parts.append(f"{who} 刚发来：{content}")
+    if images:
+        # 图片就在这条消息里（内容块紧跟在下面），说清楚模型才知道「刚发来的是图」
+        parts.append(f"{who} 刚发来 {'一张图片' if len(images) == 1 else f'{len(images)}张图片'}"
+                     f"（图片内容在下面，文字说明可能为空）：\n")
+    else:
+        parts.append(f"{who} 刚发来：{content}")
     user_prompt = "".join(parts)
 
     text = _chat_call(cfg, cfg["system_prompt"], user_prompt,
@@ -249,7 +304,7 @@ def ai_reply(cfg: dict, content: str, sender: str, chat_name: str, is_group: boo
                       timeout=cfg.get("timeout", 20),
                       temperature=cfg.get("temperature", 1.2),
                       reasoning_effort=cfg.get("reasoning_effort", "high"),
-                      api_key=api_key)
+                      api_key=api_key, images=images)
     if not text:
         return ""
     text = text.strip("「」\"'“”").strip()
@@ -690,6 +745,13 @@ class ReplyPolicy:
         self.db = db
         self.trig = cfg["trigger"]
         self.lim = cfg["limits"]
+        self.icfg = image_in.image_cfg(cfg["ai"])
+        # image_cfg 返回的是拷贝，把补全后的默认值写回，方便别处（on_msg）读同一份
+        cfg["ai"]["image"] = self.icfg
+        # 当前消息若是图片，这里挂着 (bytes, mime)；check() 用它决定该不该回
+        self.pending_image = None
+        # 每个会话最近一条「别人发来的消息」的时间（图片触发规则要用）
+        self._last_incoming: dict = {}
         self.skip_users = set(cfg.get("skip_chats", []))
         self.skip_names = set(cfg.get("skip_chat_names", []))
         self._last_reply: dict = {}
@@ -749,6 +811,40 @@ class ReplyPolicy:
             self._judge_cache[key] = hit
         return hit
 
+    def check_image(self, payload: dict) -> tuple:
+        """图片消息该不该回（与文本分开的规则）。
+
+        * `image.enabled` 是总开关（默认关），关着就当非文本处理；
+        * 图片里没有 @ 也认不出「叫名字」，所以群里是否接图由 `trigger.group_image`
+          决定（默认不接，避免群里每张图都烧一次视觉 token）；
+        * 私聊沿用 `trigger.private`，但可以额外要求「我在最近 N 分钟内说过话」
+          （`image.private_require_recent`），免得半年没聊的人甩张图就被回。
+        """
+        ic = self.icfg
+        if not ic.get("enabled"):
+            return False, "图片理解未开启"
+        if not self.pending_image:
+            return False, "图片取不到(本机无缓存)"
+        if payload["is_group"]:
+            if not self.trig.get("group_image", False):
+                return False, "群里图片不回"
+        elif not self.trig.get("private", True):
+            return False, "私聊未开启"
+        if ic.get("private_require_recent") and not payload["is_group"]:
+            # 「近期聊过」= 这个会话最近有**人**发过消息（不看我有没有回过）
+            win = float(ic.get("recent_window_seconds", 1800))
+            last = self._last_incoming.get(payload["chat_username"], 0)
+            if not last or time.time() - last > win:
+                return False, "并非近期聊过(图片不主动搭话)"
+        if payload["is_group"]:
+            # 群里图片按「这个群最近还在聊」限流：只接正在进行的对话，不给死群配图
+            win = float(ic.get("group_recent_seconds", 0) or 0)
+            if win > 0:
+                last = self._last_incoming.get(payload["chat_username"], 0)
+                if not last or time.time() - last > win:
+                    return False, f"这个群 {int(win)} 秒内没人说话(群里图片不主动搭话)"
+        return True, "ok"
+
     def check(self, payload: dict, recent=None) -> tuple:
         """返回 (是否回复, 原因)。"""
         if payload["is_self"]:
@@ -764,11 +860,21 @@ class ReplyPolicy:
         if payload["type"] not in self.trig.get("types", ["文本"]):
             return False, f"非文本({payload['type']})"
 
+        if payload["type"] == "图片":
+            # 图片没有正文，@ 不进来，所以触发规则单独一套
+            ok, why = self.check_image(payload)
+            if not ok:
+                return False, why
+
         age = time.time() - float(payload["timestamp"] or 0)
         if age > self.trig.get("max_age_seconds", 120):
             return False, f"消息过旧({int(age)}s)"
 
-        if payload["is_group"]:
+        if payload["type"] == "图片":
+            # 图片没有正文、@ 也进不来：该不该回已经由 check_image 单独判过了，
+            # 这里必须跳过下面那套「认名字 / @」的群聊闸门（否则永远卡在「群里没@我」）
+            pass
+        elif payload["is_group"]:
             if not self.trig.get("group_at", True):
                 return False, "群聊未开启"
             text = payload["content"]
@@ -1089,7 +1195,100 @@ def do_send_impl(args, get_gui, send_lock, db, text, chat_username, chat_name):
     return send_multi_impl(get_gui, send_lock, db, [text], chat_username, chat_name)[0]
 
 
+def test_image_file(path: str, question: str, cfg: dict, me_name: str, api_key: str) -> int:
+    """用一张本地图片走一遍「看图 + 生成回复」（不发消息）。只读，安全。"""
+    with open(path, "rb") as f:
+        data = f.read()
+    mime = image_in.sniff_mime(data[:16])
+    if not mime:
+        print(f"⚠ 不是标准图片格式（API 只收 JPEG/PNG/GIF/WebP）：{path}")
+        return 1
+    print(f"图片：{path}（{len(data)//1024}KB {mime}）")
+    reply = ai_reply(cfg["ai"], question, "测试好友", "测试会话", False,
+                     history=[f"测试好友: {question}"] if question else None,
+                     me_name=me_name, api_key=api_key, images=[(data, mime)])
+    ms = dict(cfg["ai"].get("multi_send") or {})
+    texts = split_for_send(reply, ms)
+    print(f"AI 生成 {len(texts)} 条：")
+    for i, t in enumerate(texts, 1):
+        print(f"  ({i}) {t}")
+    return 0 if texts else 1
+
+
 def main():
+    # ---- 只读诊断模式：必须在拿单实例锁之前处理，机器人跑着也能用 ----
+    # （--test-image 一张图 → 看它看不看得懂，默认不发）
+    if "--test-image" in sys.argv:
+        ip = argparse.ArgumentParser(description="试一下机器人看不看得懂一张图片（默认只打印）")
+        ip.add_argument("--config", default=CONFIG_PATH)
+        ip.add_argument("--test-image", default="")
+        ip.add_argument("--question", default="", help="配一句话一起发（可选）")
+        ip.add_argument("--send", action="store_true",
+                        help="把生成的回复发到「文件传输助手」（测试专用）")
+        ia, _unknown = ip.parse_known_args()
+        icfg = load_config(ia.config)
+        db0 = WeChatDB()
+        res0 = SenderResolver(db0)
+        ikey = load_api_key()
+        me0 = (db0.get_self_info() or {}).get("nick_name") or ""
+        target = (ia.test_image or "").strip()
+        question = ia.question or "嗯？"
+        if os.path.isfile(target):
+            rc = test_image_file(target, question, icfg, me0, ikey)
+            if rc or not ia.send:
+                return rc
+            # --send 时重跑一次拿回复文本（只在文件传输助手里发，测试专用）
+            with open(target, "rb") as f:
+                data = f.read()
+            reply = ai_reply(icfg["ai"], question, "测试好友", "测试会话", False,
+                             history=[f"测试好友: {question}"], me_name=me0,
+                             api_key=ikey, images=[(data, image_in.sniff_mime(data[:16]))])
+            texts = split_for_send(reply, dict(icfg["ai"].get("multi_send") or {}))
+            if texts:
+                box = {"gui": None}
+
+                def _g():
+                    if box["gui"] is None:
+                        from wechatauto.guia import WeChatGUI
+                        box["gui"] = WeChatGUI()
+                    return box["gui"]
+
+                tgt = "filehelper"
+                ok = send_multi_impl(_g, threading.Lock(), db0, texts, tgt,
+                                     db0.get_nickname(tgt) or tgt)[0]
+                print(f"发送到「文件传输助手」：{'成功' if ok else '失败'}")
+            return 0
+        # 不是文件路径 → 当成「会话里最近一张图」：--test-image 某个群
+        cu = target
+        if cu and not _looks_like_wxid(cu):
+            try:
+                cu = db0.group_name_to_id(cu) or db0.username_by_nickname(cu) or cu
+            except Exception:  # noqa: BLE001
+                cu = target
+        if not cu:
+            print("⚠ 用 --test-image 指定一张本地图片路径，或一个会话（取它最近一张图）")
+            return 1
+        rows = db0.get_image_rows(cu, limit=1)
+        if not rows:
+            print(f"会话「{db0.get_nickname(cu) or cu}」里没有图片消息")
+            return 1
+        lid = rows[0].get("local_id")
+        odir = os.path.join(BASE_DIR, "media")
+        data, mime = image_in.read_image(db0, cu, lid, _as_text(rows[0].get("content")),
+                                        save_dir=odir, log=print)
+        if not data:
+            print("这张图本机没有可用的缓存（没在微信里点开过），换一张或先在微信里看一眼")
+            return 1
+        name = db0.get_nickname(cu) or cu
+        print(f"会话「{name}」最近一张图 #{lid}：{len(data)//1024}KB {mime}")
+        reply = ai_reply(icfg["ai"], question, "群友", name, "@chatroom" in (cu or ""),
+                         history=None, me_name=me0, api_key=ikey, images=[(data, mime)])
+        texts = split_for_send(reply, dict(icfg["ai"].get("multi_send") or {}))
+        print(f"AI 生成 {len(texts)} 条：")
+        for i, t in enumerate(texts, 1):
+            print(f"  ({i}) {t}")
+        return 0
+
     # ---- 只读诊断模式：必须在拿单实例锁之前处理，机器人跑着也能用 ----
     # （--can-answer "<群里的话>" --chat 群名 → 看这句话会不会被主动接）
     if "--can-answer" in sys.argv:
@@ -1167,7 +1366,8 @@ def main():
     if not acquire_single_instance_lock():
         print("[已在运行] 机器人已经启动过了，不要再开一个——两个进程会抢微信的")
         print("           解密缓存，第二个必然报 PermissionError。")
-        print(f"           要重启：先关掉原来那个窗口；若确认已经没在跑，删掉 {LOCK_FILE} 再试。")
+        print(f"           要重启：双击 restart_bot.bat（它会先停旧实例再启动）；")
+        print(f"           若确认没有别的实例在跑，删掉 {LOCK_FILE} 再试。")
         return 1
     import atexit
     atexit.register(release_lock)
@@ -1249,6 +1449,14 @@ def main():
         print(f"群内额外触发：提到「{'、'.join(policy.name_hits)}」即回；"
               f"话题相关时再用一次轻量判定（回看 {cfg['trigger'].get('context_lookback', 8)} 条）")
     print(uns.describe())
+    _ic = image_in.image_cfg(cfg["ai"])
+    if _ic.get("enabled"):
+        print(f"看图：开（私聊={'回' if cfg['trigger'].get('private') else '不回'}，"
+              f"群图={'回' if cfg['trigger'].get('group_image') else '不回'}，"
+              f"detail={_ic.get('detail')}，单张≤{int(_ic.get('max_bytes') or 0)//1024//1024}MB，"
+              f"缓存目录={_ic.get('save_dir') or os.path.join(BASE_DIR, 'media')}）")
+    else:
+        print("看图：关（config.json → ai.image.enabled 打开后，机器人才能看到图片内容）")
     print(f"模式：{'DRY-RUN（不发送）' if args.dry_run else '正式（会真的发送）'}")
     print(f"输入方式：{input_mode}")
     # 上游节奏层：档位决定写动作间隔/突发上限，误用默认档会莫名其妙等几十秒
@@ -1288,8 +1496,41 @@ def main():
                 print(f"  [读取群成员失败] {type(e).__name__}: {e}", flush=True)
         return block
 
+    mem = image_in.ImageMemory()
+    img_dir = image_in.image_cfg(cfg["ai"]).get("save_dir") or os.path.join(BASE_DIR, "media")
+
+    def fetch_image(payload: dict, local_id):
+        """取出这条图片消息的字节（带缓存）；拿不到返回 None。"""
+        if local_id is None:
+            return None
+        hit = mem.get(payload["chat_username"], local_id)
+        if hit:
+            return hit
+        ic = image_in.image_cfg(cfg["ai"])
+        data, mime = image_in.read_image(db, payload["chat_username"], local_id, "",
+                                         save_dir=img_dir, log=print)
+        if not data:
+            return None
+        if len(data) > int(ic.get("max_bytes") or image_in.MAX_BYTES_DEFAULT):
+            print(f"  · 图片 #{local_id} 太大（{len(data)//1024}KB），跳过", flush=True)
+            return None
+        item = (data, mime)
+        mem.put(payload["chat_username"], local_id, item)
+        return item
+
     def on_msg(msg: dict, _lst: Listener):
         payload = build_payload(db, resolver, msg)
+        if not payload["is_self"]:
+            policy._last_incoming[payload["chat_username"]] = time.time()
+        # 图片消息：先取图（policy.check 要用它判断该不该回，生成回复时直接复用）
+        local_id = msg.get("local_id")
+        policy.pending_image = None
+        if payload["type"] == "图片" and image_in.image_cfg(cfg["ai"]).get("enabled"):
+            policy.pending_image = fetch_image(payload, local_id)
+            if policy.pending_image:
+                print(f"  · 已读取 {payload['chat_name']} 的图片 #{local_id}"
+                      f"（{len(policy.pending_image[0])//1024}KB {policy.pending_image[1]}）",
+                      flush=True)
         # 上下文只取一次（排除刚收到的这条，别重复喂给模型）；三处判定/生成共用
         history = build_history(
             db, resolver, payload["chat_username"],
@@ -1323,7 +1564,8 @@ def main():
                      f"{payload['sender']}: {payload['content']}")
             reply = ai_reply(cfg["ai"], payload["content"], payload["sender"], payload["chat_name"],
                              payload["is_group"], history, me_name=me_name,
-                             mem_block=build_mem_block(payload), api_key=api_key)
+                             mem_block=build_mem_block(payload), api_key=api_key,
+                             images=[policy.pending_image] if policy.pending_image else None)
         if not reply:
             log_line("  AI 未生成回复，跳过")
             return

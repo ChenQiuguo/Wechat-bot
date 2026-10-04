@@ -23,6 +23,7 @@
 | 群聊 @ 自动回复 | 自动识别 `@本账号昵称` |
 | **提到名字也回** | 没被 @、但正文里叫了本账号的名字，或接着上文问关于他的事，也会接话（靠一次轻量判定，拿不准就答否） |
 | **主动接问题** | 群里没人点他，但有人问了个他确实答得上来的具体问题，会主动接一句；答不上来或只是闲聊就不插话（默认关闭） |
+| **看图** | 对方**发图片**也能看懂（截图、照片、图表里的字都认）。图片从本地缓存解密，**不点开图片、不驱动界面**；默认私聊接图、群里不接（默认关闭） |
 | **一句一条** | 回复按句子自动拆开、一句一条发出去，像真人打字；可切回「整段一条」 |
 | **不碰剪贴板** | 发送走 `SendInput` Unicode 逐字注入，**不写系统剪贴板**（对开了剪贴板多端同步的人很重要） |
 | **思考模式** | 回复前先推理（思维链），回答更有条理；可用 `reasoning_effort` 调强度 |
@@ -70,6 +71,15 @@ pip install -r requirements.txt
       "max_chars_per_message": 60,
       "max_messages": 4,
       "separator": "|||"
+    },
+    "image": {
+      "enabled": false,
+      "detail": "low",
+      "max_bytes": 8388608,
+      "save_dir": "",
+      "private_require_recent": false,
+      "recent_window_seconds": 1800,
+      "group_recent_seconds": 0
     }
   },
   "input": {
@@ -85,7 +95,8 @@ pip install -r requirements.txt
     "name_hits": [],
     "context_judge": true,
     "context_lookback": 8,
-    "types": ["文本"],
+    "types": ["文本", "图片"],
+    "group_image": false,
     "max_age_seconds": 120
   },
   "limits": {
@@ -113,6 +124,9 @@ pip install -r requirements.txt
 | `input.method` | `unicode`＝只用键盘注入（默认）；`auto`＝注入失败可回退剪贴板；`clipboard`＝不打补丁 |
 | `trigger.context_judge` | 没人点你时，是否花一次轻量判定决定「要不要接话」 |
 | `unsolicited.enabled` | 群里有人问了能答的问题时是否**主动**接一句（默认关，开了也只在群聊、私聊永不主动） |
+| `ai.image.enabled` | 是否**看图**：对方发图片时把图片内容一起给模型（默认关；视觉调用比文本贵，1 张图≈1000 token） |
+| `trigger.group_image` | 群里收到图片是否也接（默认关——图片没有 @，开了就是「整群图片都看」；可再配合 `ai.image.group_recent_seconds` 只接正在聊的群） |
+| `ai.image.detail` | `low`（默认，先缩到 512×512，快且省）／`original`（要看清小字时用） |
 
 **API Key** 按顺序从这些位置找（都不会被写进仓库）：
 
@@ -126,6 +140,8 @@ pip install -r requirements.txt
 python wx_bot.py                       :: 正式运行
 python wx_bot.py --dry-run             :: 只生成回复不发送（安全预览）
 python wx_bot.py --test-reply "你好"    :: 走完整 AI+发送流程（发到文件传输助手）
+python wx_bot.py --test-image D:\a.jpg  :: 试「看图」：给一张本地图，看它看懂没（默认不发）
+python wx_bot.py --test-image 某个群     :: 试「看图」：拿该会话最近一张图片来试
 python wx_push.py --webhook http://...  :: 只监听并推送 JSON（不回复）
 ```
 
@@ -145,6 +161,7 @@ python tools/measure_tokens.py          :: 实测单次回复的 token 消耗与
 python tools/bench_send.py 3            :: 对比两种发送路径的耗时
 python tools/probe_send_filehelper.py   :: 端到端发送自测（默认只输入不发送；只发文件传输助手）
 python tools/probe_focus_after_open.py  :: 实测打开会话后焦点是否已在输入框
+python tools/probe_image_read.py        :: 验证「对方发的图片」能否读出并解密（只读，不发送）
 ```
 
 > ⚠️ 自测请一律用**文件传输助手**（`filehelper`，它在 `skip_chats` 里，机器人不会回复它），
@@ -361,6 +378,27 @@ OCR 回退路径 `input_text`（`set_clipboard` + `Ctrl+V`）。如果开了剪�
 
 同一次连发实测：`fast` 档（写动作间隔 0.6–1.4s、120s 内 20 次）第 1 条 1.55s、第 2 条 1.67s；
 `natural` 档第 2 条 43.34s（其中 41.95s 是纯等待）。**跑实测脚本前记得设档位。**
+
+### 16. 看图：图片是「本地缓存 + 32 位 hex 指纹」，不用点开
+
+`deepseek-flash` 本身是多模态，所以难的不是调模型，是**把图拿到手**：
+
+1. 图片消息的正文是一段 XML，里面那个 **32 位 hex 就是本地 `.dat` 缓存的文件名**
+   （群消息正文还带 `wxid_xxx:` 前缀，**先剥前缀再找指纹**，否则会取错）；
+2. 一条图本机最多三档：`_h.dat` 原件 > `.dat` 微信下发那份 > `_t.dat` 预览图。
+   本程序**只读缓存、不驱动界面**（不点开图片、不把微信窗口拽到前台），
+   取「不是预览图的那一份」，一份都没有就跳过这张图；
+3. 解密后**按文件实际内容**嗅探格式（JPEG/PNG/GIF/WebP），base64 内联进请求。
+   `wxgf` 是微信动画表情的容器（内部 HEVC），不是标准图，跳过；
+4. **图片只能放在 user 消息里**——放进 system 会 400（官方限制）。官方另外限制：
+   单图 ≤32MiB、请求体 ≤48MiB、`detail: low` 会先缩到 512×512（1 张图最多算 1024 token）。
+
+踩坑：`ReplyPolicy.check()` 里那套「群里认名字 / @」的闸门会把图片消息**永久卡在
+「群里没@我」**——图片正文是 `[图片]`，既不含名字也不以问号结尾。所以图片走
+`check_image()` 单独判，并在群聊闸门处显式跳过。
+
+另一个取舍：历史上下文里的图片只留 `[发了一张图片]` 占位，**不把历史图也解密喂进去**
+（否则每张历史图都是上千 token）；只有当前这条消息的图会真的给模型看。
 
 ## 致谢
 
