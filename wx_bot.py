@@ -205,7 +205,11 @@ def ai_reply(cfg: dict, content: str, sender: str, chat_name: str, is_group: boo
         text = text.strip("「」\"'“”").strip()
         # 句末不加句号（模型偶尔仍会加，这里兜底剥掉；问号/感叹号/省略号保留）
         text = text.rstrip("。.").rstrip()
-        return text[:60]
+        # 长度上限可配置：默认 220 字，够展开讲清楚，又不至于刷屏
+        limit = int(cfg.get("max_chars", 220) or 0)
+        if limit > 0:
+            text = text[:limit].rstrip()
+        return text
     except Exception as e:  # noqa: BLE001
         print(f"[AI 失败] {type(e).__name__}: {e}", flush=True)
         return ""
