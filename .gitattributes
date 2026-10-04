@@ -1,0 +1,11 @@
+# 默认：仓库内存 LF，检出时按平台转换
+* text=auto
+
+# Windows 批处理必须是 CRLF，否则 cmd 可能不认 goto 标签
+*.bat text eol=crlf
+
+# 其余统一 LF
+*.py  text eol=lf
+*.md  text eol=lf
+*.json text eol=lf
+*.txt text eol=lf

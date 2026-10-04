@@ -1,0 +1,20 @@
+# 运行时产物
+bot.lock
+bot_replies.log
+wechat_messages.log
+wx_messages.jsonl
+
+# 密钥（千万不要提交）
+apikey.txt
+.env
+config.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器
+.vscode/
+.idea/
