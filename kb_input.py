@@ -143,6 +143,11 @@ def type_into(ctrl, text: str, per_char_sleep: float = 0.012) -> bool:
     """
     global type_attempts
     type_attempts += 1
+    return type_into_impl(ctrl, text, per_char_sleep)
+
+
+def type_into_impl(ctrl, text: str, per_char_sleep: float = 0.012) -> bool:
+    """type_into 的实际实现（不计数，供「先打字、失败再补焦点重试」复用）。"""
     if not clear(ctrl):
         return False
     bad, units = type_unicode(text, per_char_sleep)
@@ -155,6 +160,24 @@ def type_into(ctrl, text: str, per_char_sleep: float = 0.012) -> bool:
         return True
     clear(ctrl)
     return False
+
+
+def retry_after_refocus(ctrl, text: str, per_char_sleep: float, refocus) -> bool:
+    """注入失败时补一次焦点再重试。
+
+    ``refocus`` 是调用方给的「把焦点交回输入框」的动作。刻意**不**接收
+    WeChatGUI.get_input_box() 那种带截屏/OCR 的探测——实测那种要 17 秒。
+    返回是否最终注入成功。
+    """
+    global type_attempts
+    try:
+        if not refocus():
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    time.sleep(0.3)
+    type_attempts += 1
+    return type_into_impl(ctrl, text, per_char_sleep)
 
 
 # --------------------------------------------------------------------------

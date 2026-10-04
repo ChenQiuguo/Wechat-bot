@@ -45,6 +45,7 @@ from wechatauto.guia import WeChatGUI
 
 db = WeChatDB()
 gui = WeChatGUI()
+wx_bot.wire_gui(gui)      # 登记给输入补丁（连发复用输入框要用）
 if not CHAT:
     try:
         for c in (db.list_message_chats() or []):
@@ -61,9 +62,22 @@ print(f"目标群：{CHAT}")
 
 TEXT = "测试一下新的输入方式，这条不用剪贴板发的"
 if DO_SEND:
-    print(f"要真的发出：{TEXT!r}")
-    resp = gui.send_msg(TEXT, CHAT, False)
-    print(f"send_msg 返回：{resp}")
+    # 按机器人的真实顺序：先用会话列表点开，再连发（和一句一条一样）
+    names = wx_bot.resolve_display_names(db, "", CHAT)
+    opened, why = False, ""
+    for n in names:
+        opened, why = wx_bot.open_chat_via_session_list(gui, n)
+        if opened:
+            break
+    print(f"用会话列表打开：{opened}（{why}）")
+    t_all = time.time()
+    for i, t in enumerate((TEXT, TEXT + "（第二条）"), 1):
+        t0 = time.time()
+        resp = gui.send_msg(t, None, False)
+        ok = bool(getattr(resp, "is_success", None)) or \
+            (isinstance(resp, dict) and resp.get("status") == "成功")
+        print(f"  第{i}条 {'✅' if ok else '❌'} {time.time() - t0:.2f}s | {resp}")
+    print(f"  两条合计 {time.time() - t_all:.2f}s")
 else:
     print(f"只测输入（不发）：{TEXT!r}")
     if not gui.open_chat(CHAT):

@@ -59,7 +59,8 @@
   "input": {
     "method": "unicode",
     "char_delay": 0.012,
-    "fallback_clipboard": false
+    "fallback_clipboard": false,
+    "click_input": false
   },
   "unsolicited": {
     "enabled": false,

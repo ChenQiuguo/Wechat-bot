@@ -516,7 +516,16 @@ def input_cfg(cfg: dict) -> dict:
     ic.setdefault("method", "unicode")          # unicode | auto | clipboard
     ic.setdefault("char_delay", 0.012)
     ic.setdefault("fallback_clipboard", True)   # 注入失败时才允许碰剪贴板（auto 模式）
+    ic.setdefault("click_input", False)         # 打开会话后焦点已在输入框，默认不点
     return ic
+
+
+_GUI_REF = {"gui": None}      # 当前进程里那个 WeChatGUI 实例（连发复用输入框要用）
+
+
+def wire_gui(gui) -> None:
+    """把 WeChatGUI 实例登记进来，补丁才能复用它的 _last_input_box。"""
+    _GUI_REF["gui"] = gui
 
 
 def install_input_patch(ic: dict) -> str:
@@ -534,6 +543,7 @@ def install_input_patch(ic: dict) -> str:
     kb_input.set_unicode_typing(True)
     allow_cb = bool(ic.get("fallback_clipboard", True)) and mode != "unicode"
     delay = float(ic.get("char_delay", 0.012) or 0.012)
+    click_first = bool(ic.get("click_input", False))
 
     from wechatauto.guia import WeChatGUI
     from wechatauto.uia_driver import WeChatUIA
@@ -545,16 +555,33 @@ def install_input_patch(ic: dict) -> str:
 
         def _paste_into(self, ctrl, text, clear=True):
             stats_before = kb_input.type_attempts
-            try:
-                ctrl.SetFocus()
-            except Exception:  # noqa: BLE001
-                pass
-            time.sleep(0.1)
+
+            def _remember_box():
+                # 让连发的第 2、3 条能走 guia 的 fast 路径（跳过重复的焦点/会话检查）。
+                # 值必须是**当前会话名**：guia 拿它和 who 比对，对不上就不会用这条快路径。
+                try:
+                    inst = _GUI_REF.get("gui")
+                    owner = self.current_chat()
+                    if inst is not None and owner:
+                        inst._last_input_box = owner
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # 实测：打开会话后键盘焦点已经在输入框上，直接注入即可（1.2s）；
+            # 点输入框要走 OCR 探测输入框位置，实测慢到 17s，所以默认不点。
             try:
                 if kb_input.type_into(ctrl, text, delay):
+                    _remember_box()
                     return
             except Exception as e:  # noqa: BLE001
-                print(f"  [输入] Unicode 注入异常，回退剪贴板：{type(e).__name__}: {e}", flush=True)
+                print(f"  [输入] Unicode 注入异常：{type(e).__name__}: {e}", flush=True)
+            # 焦点没落在输入框（用户手点过别处等）：UIA 重开一次会话即可把焦点交回输入框。
+            # 注意不能调 WeChatGUI.get_input_box()——那是截屏/OCR 探测，实测 17s。
+            if not click_first and kb_input.retry_after_refocus(
+                    ctrl, text, delay, lambda: self.open_chat(self.current_chat() or "")):
+                print("  [输入] 焦点兜底：重开会话后注入成功", flush=True)
+                _remember_box()
+                return
             if not allow_cb and kb_input.type_attempts != stats_before:
                 # 明确要求只用键盘注入：失败就让它失败，别偷偷用剪贴板
                 raise RuntimeError("Unicode 注入失败，且已禁止回退剪贴板")
@@ -570,34 +597,35 @@ def install_input_patch(ic: dict) -> str:
 
         def input_text(self, text, box=None, fast=False):
             tried = False
-
-            def attempt(t):
-                nonlocal tried
-                box_ = box or self.get_input_box()
-                if not box_ or not self.focus_input(box_):
-                    return False
-                ctrl = self._get_uia()._chat_input() if self._get_uia() is not None else None
-                if ctrl is not None:
-                    stats_before = kb_input.type_attempts
-                    if kb_input.type_into(ctrl, t, delay):
-                        self._last_input_box = box_
-                        return True
-                    tried = tried or (kb_input.type_attempts != stats_before)
-                if not allow_cb:
-                    return False
-                self.set_clipboard(t)
-                self._input.key(_VK_A_CTRL[0], ctrl=True)
-                self._input.key(0x2E)              # Delete
-                self._input.key(_VK_V_CTRL[0], ctrl=True)
-                time.sleep(0.8)
-                if self._input_box_has_text(box_):
-                    self._last_input_box = box_
+            uia = self._get_uia()
+            ctrl = uia._chat_input() if uia is not None else None
+            # 会话刚打开，焦点就在输入框：直接注入。
+            # 刻意不调 self.get_input_box()（截屏/OCR，实测 17s）；
+            # 只有真的需要「点一下输入框」时才付这个代价。
+            if ctrl is not None:
+                stats_before = kb_input.type_attempts
+                if kb_input.type_into(ctrl, text, delay):
+                    self._last_input_box = box or getattr(self, "_last_input_box", None)
                     return True
+                tried = tried or (kb_input.type_attempts != stats_before)
+                if kb_input.retry_after_refocus(ctrl, text, delay,
+                                                lambda: self.focus_input(box or self.get_input_box())):
+                    self._last_input_box = box or getattr(self, "_last_input_box", None)
+                    return True
+            if not allow_cb:
                 return False
-
-            if attempt(text):
+            b = box or self.get_input_box()
+            if not b or not self.focus_input(b):
+                return False
+            self.set_clipboard(text)
+            self._input.key(_VK_A_CTRL[0], ctrl=True)
+            self._input.key(0x2E)              # Delete
+            self._input.key(_VK_V_CTRL[0], ctrl=True)
+            time.sleep(0.8)
+            if self._input_box_has_text(b):
+                self._last_input_box = b
                 return True
-            if tried and not allow_cb:
+            if tried:
                 return False
             return orig(self, text, box, fast)   # 让上游自己的重试/拼音兜底接手
 
@@ -606,9 +634,8 @@ def install_input_patch(ic: dict) -> str:
 
     _patch_paste_into()
     _patch_input_text()
-    if allow_cb:
-        return f"Unicode 注入（不碰剪贴板）· 失败时才回退剪贴板 · 逐字 {delay * 1000:.0f}ms"
-    return f"Unicode 注入（不碰剪贴板，禁用剪贴板回退）· 逐字 {delay * 1000:.0f}ms"
+    tag = f"Unicode 注入（不碰剪贴板{'' if allow_cb else '，禁用剪贴板回退'}）· 逐字 {delay * 1000:.0f}ms"
+    return tag + ("· 先点输入框" if click_first else "· 不点输入框（实测焦点已在）")
 
 
 _VK_A_CTRL = (0x41,)
@@ -1126,6 +1153,7 @@ def main():
         if sender["gui"] is None:
             from wechatauto.guia import WeChatGUI
             sender["gui"] = WeChatGUI()
+            wire_gui(sender["gui"])        # 登记给输入补丁，连发才能复用输入框
         return sender["gui"]
 
     def do_send(text: str, chat_username: str, chat_name: str) -> bool:
@@ -1168,6 +1196,16 @@ def main():
     print(uns.describe())
     print(f"模式：{'DRY-RUN（不发送）' if args.dry_run else '正式（会真的发送）'}")
     print(f"输入方式：{input_mode}")
+    # 上游节奏层：档位决定写动作间隔/突发上限，误用默认档会莫名其妙等几十秒
+    try:
+        from wechatauto import rhythm
+        _prof = rhythm.profile()      # 会按需加载并把档位落盘到 ~/.wechatauto/rhythm.json
+        print(f"节奏档位：{getattr(_prof, 'name', '?')}"
+              f"（写动作间隔 {getattr(_prof, 'gap', '?')}s，"
+              f"窗口 {getattr(_prof, 'window', '?')}s 内上限 {getattr(_prof, 'burst', '?')} 次，"
+              f"撞上限冷却 {getattr(_prof, 'cooloff', '?')}s）")
+    except Exception as e:  # noqa: BLE001
+        print(f"节奏档位：读取失败（{type(e).__name__}: {e}）")
     print(f"回复日志 → {REPLY_LOG}\n", flush=True)
 
     lst = Listener(db, interval=1.0)
