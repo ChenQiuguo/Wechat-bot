@@ -67,12 +67,13 @@ class SenderResolver:
     def __init__(self, db: WeChatDB):
         self.db = db
         self.me = (db.get_self_info() or {}).get("username", "") or ""
-        # 绕过库里 "sender_id != 2" 的判断，拿到完整的 id→wxid 映射
+        # 全局 id→wxid 映射（注意：这张表跨群共享，可能张冠李戴，只作兜底）
         try:
             self.index = dict(db._sender_id_index())  # noqa: SLF001
         except Exception:
             self.index = {}
         self.self_id = self._learn_self_id()
+        self._rosters: dict = {}   # chatroom -> {wxid: 群内昵称}
 
     def _learn_self_id(self):
         """文件传输助手是「自己和自己」的会话，里面的消息必然都是自己发的。"""
@@ -85,30 +86,72 @@ class SenderResolver:
             pass
         return 2  # 库里其它机器上的约定
 
-    def resolve(self, msg: dict) -> tuple:
-        """返回 (是否自己发的, 发送者 wxid, 显示名)。"""
+    def roster(self, chatroom: str) -> dict:
+        """本群成员：wxid → 群内昵称（带缓存）。
+
+        群消息的发送者必须用这张表来认，不能用全局 id 映射——那个 id 是
+        跨群共享的，会把别的群的成员错安到本群的人头上。
+        """
+        if not chatroom:
+            return {}
+        if chatroom in self._rosters:
+            return self._rosters[chatroom]
+        m: dict = {}
+        try:
+            for x in (self.db.get_group_members(chatroom) or []):
+                wx = (x.get("username") or "").strip()
+                nm = (x.get("nick_name") or x.get("remark") or "").strip()
+                if wx:
+                    m[wx] = nm or wx
+        except Exception:
+            m = {}
+        self._rosters[chatroom] = m
+        return m
+
+    @staticmethod
+    def _prefix_wxid(content) -> str:
+        """群消息正文前缀里的发送者 wxid —— 最可靠的来源。
+
+        实测群文本形如：``wxid_xxxxxxxx:\\n正文``
+        """
+        m = re.match(r"^(wxid_[0-9A-Za-z_\-]{3,}):", _as_text(content))
+        return m.group(1) if m else ""
+
+    def resolve(self, msg: dict, chat: str = "") -> tuple:
+        """返回 (是否自己发的, 发送者 wxid, 显示名)。
+
+        ``chat`` 可以显式传入会话 username；不传时从 msg["username"] 取
+        （注意：``db.get_messages()`` 返回的字典**没有** username 字段，
+        只有 Listener 回调的字典有，所以外部调用请显式传）。
+        """
         sid = msg.get("sender_id") or 0
-        wxid = (msg.get("sender_username") or "").strip()
+        chat = chat or msg.get("username") or ""
+        is_group = "@chatroom" in chat
+
+        # 优先级：正文前缀 > 库解析 > 全局 id 表（后者跨群可能错配）
+        wxid = ""
+        if is_group:
+            wxid = self._prefix_wxid(msg.get("content"))
+        if not wxid:
+            wxid = (msg.get("sender_username") or "").strip()
         if not wxid and sid:
             wxid = self.index.get(int(sid), "")
 
-        if wxid and self.me and wxid == self.me:
-            return True, wxid, "我"
-        if sid and sid == self.self_id:
-            return True, self.me or "", "我"
-        if self.me and wxid == "" and sid in (0, self.self_id):
-            return True, self.me, "我"
+        if (wxid and self.me and wxid == self.me) or (sid and sid == self.self_id):
+            return True, self.me or wxid, "我"
 
         name = ""
-        if wxid:
+        if is_group and wxid:
+            name = self.roster(chat).get(wxid, "")
+        if not name and wxid:
             try:
                 name = self.db.get_nickname(wxid) or ""
             except Exception:
                 name = ""
-            if name == wxid:  # 库里查不到时会原样返回 wxid，此时退回 wxid 显示
-                name = wxid
+            if name == wxid:      # 库里查不到时会原样返回 wxid
+                name = ""
         if not name:
-            name = f"未知用户(id={sid})"
+            name = wxid or f"未知用户(id={sid})"
         return False, wxid, name
 
 

@@ -21,3 +21,6 @@ venv/
 # 编辑器
 .vscode/
 .idea/
+
+# 上游库自己写的运行日志
+wechatauto_logs/

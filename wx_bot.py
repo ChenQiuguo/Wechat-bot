@@ -531,6 +531,19 @@ def main():
         if mem_block:
             print(f"  · 已注入 {payload['chat_name']} 的记忆档案", flush=True)
 
+        # 群聊：注入「本群成员名单」，避免认错人 / 编造名字
+        if payload["is_group"]:
+            try:
+                roster = resolver.roster(payload["chat_username"])
+                names = [n for w, n in roster.items() if n and w != resolver.me]
+                if names:
+                    mem_block += ("\n\n【本群成员（当前昵称）】" + "、".join(names[:60])
+                                  + "\n称呼别人只能用这些名字或聊天记录里出现过的名字，"
+                                    "绝不要自己编名字；不确定是谁就直接问。")
+                    print(f"  · 已注入本群 {len(names)} 位成员名单", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"  [读取群成员失败] {type(e).__name__}: {e}", flush=True)
+
         reply = ai_reply(cfg["ai"], payload["content"], payload["sender"], payload["chat_name"],
                          payload["is_group"], history, me_name=info.get("nick_name") or "",
                          mem_block=mem_block)
