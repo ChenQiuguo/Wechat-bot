@@ -60,11 +60,24 @@ CASES = [
       "阿伟: @你的昵称 你觉得我要不要从现在的公司跳槽，钱多但加班狠"]),
 ]
 
+def _sep(ai_cfg) -> str:
+    ms = ai_cfg.get("multi_send") or {}
+    return (ms.get("separator", "|||") if ms.get("enabled", True) else "")
+
+
 for sender, chat_name, is_group, text, history in CASES:
     h = history if USE_HISTORY else None
     reply = wx_bot.ai_reply(cfg, text, sender, chat_name, is_group, h, me_name="你的昵称")
     print(f"[{'群' if is_group else '私'}] {sender}: {text}")
     if USE_HISTORY and history:
         print(f"     （上下文 {len(history)} 条）")
-    print(f"  → {reply}")
+    # 开了 multi_send 就按同一规则切分，看得出一条会不会分成好几条发
+    ms = cfg.get("multi_send") or {}
+    parts = wx_bot.parse_multi(reply, _sep(cfg), int(ms.get("max_messages", 1)))
+    if len(parts) > 1:
+        print(f"  → 会分 {len(parts)} 条发：")
+        for i, p in enumerate(parts, 1):
+            print(f"     ({i}) {p}")
+    else:
+        print(f"  → {reply}")
     print()

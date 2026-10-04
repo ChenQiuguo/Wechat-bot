@@ -560,8 +560,230 @@ def open_chat_via_session_list(gui, name: str, attempts: int = 2) -> tuple:
     return False, last
 
 
-def do_send_impl(args, get_gui, send_lock, db, text, chat_username, chat_name):
-    """实际发送：优先「会话列表点击」，失败回退「搜索框」（并把原因写进日志）。"""
+# --------------------------------------------------------------------------
+# 主动开话题
+# --------------------------------------------------------------------------
+
+def parse_multi(raw, separator: str = "|||", max_parts: int = 0) -> list:
+    """把 AI 输出切成要分开发送的几条。
+
+    默认不开分隔符（separator 为空）→ 整段作为一条发出，多行保留在单条里。
+    开了分隔符：按它切，条数有上限，丢弃空白段。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return []
+    if not separator:
+        return [text]
+    parts = [p.strip() for p in text.split(separator)]
+    parts = [p for p in parts if p]
+    if max_parts and len(parts) > max_parts:
+        # 超出上限就合并尾巴，宁可一条长点，也别刷屏
+        head = parts[: max_parts - 1]
+        head.append(separator.join(parts[max_parts - 1:]).replace(separator, " "))
+        parts = head
+    return parts
+
+
+def build_proactive_cfg(cfg: dict) -> dict:
+    """主动开话题的配置 + 专用提示词覆盖（安全红线原样保留）。"""
+    p = dict(cfg.get("proactive") or {})
+    if not (p.get("prompt") or "").strip():
+        p["prompt"] = (
+            cfg["ai"]["system_prompt"]
+            + "\n\n【这次不是回复，是主动开个话头】\n"
+              "群里已经安静了一会儿，你想主动说句话把话头接起来。要求：\n"
+              "1. 接上最近的话题，或说一件你这边的新鲜事/一个具体的问题，别空喊「有人在吗」；\n"
+              "2. 一两句就够，别长篇大论，别说教；\n"
+              "3. 别重复最近自己说过的话，也别把上面聊过的内容复述一遍；\n"
+              "4. 上面所有安全红线照旧生效。"
+        )
+    return p
+
+
+def proactive_reply(cfg: dict, db, resolver, chat_username: str, chat_name: str,
+                    me_name: str = "", mem_block: str = "", recent_said=None) -> str:
+    """生成一条主动消息（不发送）。"""
+    ai = dict(cfg["ai"])
+    history = build_history(db, resolver, chat_username, int(ai.get("history_limit", 8)))
+    p = build_proactive_cfg(cfg)
+    ai["system_prompt"] = p["prompt"]
+    if recent_said:
+        mem_block = (mem_block or "") + "\n\n【你最近主动说过的话，别重复】" + " / ".join(recent_said[-3:])
+    who = f"群「{chat_name}」现在没人说话"
+    return ai_reply(ai, "（现在没人发消息，你主动起个话头）", who, chat_name, True,
+                    history, me_name=me_name, mem_block=mem_block)
+
+
+def in_quiet_hours(cfg: dict, now=None) -> bool:
+    """现在是否处于免打扰时段（跨零点也支持）。"""
+    span = (cfg.get("proactive") or {}).get("quiet_hours") or []
+    if len(span) != 2:
+        return False
+    t = time.localtime(now or time.time())
+    hm = t.tm_hour * 60 + t.tm_min
+    a, b = int(span[0]) * 60, int(span[1]) * 60
+    return (a <= hm < b) if a <= b else (hm >= a or hm < b)
+
+
+def _chat_idle_seconds(db, chat_username: str) -> float:
+    """该会话最后一条消息距今多少秒（读不到就返回 0，即不主动）。"""
+    try:
+        msgs = db.get_messages(chat_username, limit=1) or []
+        if not msgs:
+            return 0.0
+        ts = float(msgs[0].get("create_time") or 0)
+        return max(0.0, time.time() - ts) if ts else 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+class ProactiveScheduler:
+    """空闲很久时主动找个话头。只对显式列进 proactive.chats 的群生效。"""
+
+    def __init__(self, cfg: dict, db, resolver, policy, send_multi, get_gui=None):
+        self.cfg = cfg
+        self.db = db
+        self.resolver = resolver
+        self.policy = policy
+        self.send_multi = send_multi
+        self.p = dict(cfg.get("proactive") or {})
+        self.chats = [c for c in (self.p.get("chats") or []) if isinstance(c, str) and c.strip()]
+        self._day = time.strftime("%Y-%m-%d")
+        self._count_today = 0
+        self._last_proactive: dict = {}
+        self._recent_said: dict = {}
+        self._lock = threading.Lock()
+        try:
+            self.me_name = (db.get_self_info() or {}).get("nick_name") or ""
+        except Exception:  # noqa: BLE001
+            self.me_name = ""
+
+    # ---- 闸门 ----
+    def _bump_day(self):
+        today = time.strftime("%Y-%m-%d")
+        if today != self._day:
+            self._day, self._count_today = today, 0
+
+    def why_not(self, chat_username: str, now: float = None) -> str:
+        """判断这个会话现在能不能主动说话，不能则返回原因。"""
+        now = now or time.time()
+        if not self.p.get("enabled", False):
+            return "主动开话题未开启"
+        if not self.chats:
+            return "没配置 proactive.chats（不知道去哪个群说话）"
+        if in_quiet_hours(self.cfg, now):
+            return "免打扰时段"
+        with self._lock:
+            self._bump_day()
+            if self._count_today >= self.p.get("max_per_day", 6):
+                return "触发每日主动上限"
+            if now - self._last_proactive.get(chat_username, 0) < self.p.get("min_gap_per_chat", 3600):
+                return "这个群刚主动过"
+        idle = _chat_idle_seconds(self.db, chat_username)
+        if idle < self.p.get("min_idle_minutes", 40) * 60:
+            return f"群里刚说过话（空闲 {int(idle / 60)} 分钟）"
+        return "ok"
+
+    def note_activity(self, chat_username: str):
+        """有人说话了 → 这个群重新计时，别再去开话头。"""
+        with self._lock:
+            self._last_proactive[chat_username] = 0.0
+
+    def _touch(self, chat_username: str):
+        """记一次尝试（哪怕没发出去）——否则调度循环会每 60 秒重试同一个群。"""
+        with self._lock:
+            self._last_proactive[chat_username] = time.time()
+
+    def _mark(self, chat_username: str, said: str):
+        with self._lock:
+            self._bump_day()
+            self._count_today += 1
+            self._last_proactive[chat_username] = time.time()
+            self._recent_said.setdefault(chat_username, []).append(said)
+            self._recent_said[chat_username] = self._recent_said[chat_username][-5:]
+
+    # ---- 主循环 ----
+    def run_once(self, chat_username: str = "", force: bool = False, dry_run: bool = False) -> bool:
+        """挑一个群说一句话。force=True 时跳过空闲/间隔判断（手动测试用）。"""
+        if chat_username:
+            if not force:
+                why = self.why_not(chat_username)
+                if why != "ok":
+                    print(f"  · 不主动：{why}", flush=True)
+                    return False
+            targets = [chat_username]
+        else:
+            targets = [c for c in self.chats if force or self.why_not(c) == "ok"]
+            if targets:
+                # 最冷清的先来
+                targets.sort(key=lambda c: -_chat_idle_seconds(self.db, c))
+        if not targets:
+            return False
+        for cu in targets:
+            try:
+                chat_name = self.db.get_nickname(cu) or cu
+            except Exception:  # noqa: BLE001
+                chat_name = cu
+            mem_block = ""
+            if self.cfg["ai"].get("memory", {}).get("enabled", True):
+                try:
+                    mem_block = memory_store.prompt_block(memory_store.load(cu))
+                except Exception:  # noqa: BLE001
+                    mem_block = ""
+            self._touch(cu)          # 先记账，失败也不至于 60 秒后又来一次
+            try:
+                raw = proactive_reply(self.cfg, self.db, self.resolver, cu, chat_name,
+                                      self.me_name, mem_block,
+                                      self._recent_said.get(cu))
+            except Exception as e:  # noqa: BLE001
+                print(f"  [主动生成失败] {type(e).__name__}: {e}", flush=True)
+                continue
+            texts = parse_multi(raw, (self.p.get("separator") or ""),
+                                int(self.p.get("max_messages", 2)))
+            if not texts:
+                print("  · 主动生成结果为空，跳过", flush=True)
+                continue
+            idle_min = int(_chat_idle_seconds(self.db, cu) / 60)
+            log_line(f"[主动开话题] {chat_name}（空闲 {idle_min} 分钟）: {' ｜ '.join(texts)}")
+            if dry_run:
+                return True
+            ok, _n = self.send_multi(texts, cu, chat_name)
+            if ok:
+                self._mark(cu, texts[0])
+                try:
+                    self.policy.mark(cu)
+                except Exception:  # noqa: BLE001
+                    pass
+                return True
+        return False
+
+    def loop(self, stop_event: threading.Event, dry_run: bool = False):
+        interval = float(self.p.get("check_interval", 60))
+        while not stop_event.wait(interval):
+            try:
+                # 一轮最多主动一次，别连环轰炸
+                self.run_once(dry_run=dry_run)
+            except Exception as e:  # noqa: BLE001
+                print(f"  [主动调度异常] {type(e).__name__}: {e}", flush=True)
+
+
+def _resp_ok(resp) -> bool:
+    ok = bool(getattr(resp, "is_success", None))
+    if not ok and isinstance(resp, dict):
+        ok = resp.get("status") == "成功"
+    return ok
+
+
+def send_multi_impl(get_gui, send_lock, db, texts, chat_username, chat_name,
+                    gap: float = 1.0) -> tuple:
+    """把若干条消息依次发给同一会话：只打开一次会话，之后连发。
+
+    返回 (是否全部发出, 已发出的条数)。
+    """
+    texts = [t for t in (texts or []) if (t or "").strip()]
+    if not texts:
+        return True, 0
     with send_lock:
         t0 = time.time()
         try:
@@ -572,22 +794,35 @@ def do_send_impl(args, get_gui, send_lock, db, text, chat_username, chat_name):
                 opened, why = open_chat_via_session_list(gui, n)
                 if opened:
                     break
+            who = names[0] if names else (chat_name or chat_username)
             if opened:
-                resp = gui.send_msg(text, None, False)   # 已确认打开 → 跳过打开步骤
                 via = "列表点击"
             else:
-                who = names[0] if names else (chat_name or chat_username)
-                resp = gui.send_msg(text, who, False)     # 回退：搜索框
                 via = f"搜索回退[{why}]"
-            ok = bool(getattr(resp, "is_success", None))
-            if not ok and isinstance(resp, dict):
-                ok = resp.get("status") == "成功"
-            log_line(f"{'[已发送]' if ok else '[发送异常]'} → {chat_name}: {text} "
-                     f"| {via} {time.time() - t0:.1f}s | resp={resp}")
-            return ok
+            sent = 0
+            for i, text in enumerate(texts):
+                if not (opened or i == 0):
+                    break        # 会话没打开成功，只有第一条能靠搜索框补
+                resp = gui.send_msg(text, None if opened else who, False)
+                ok = _resp_ok(resp)
+                sent += 1 if ok else 0
+                log_line(f"{'[已发送]' if ok else '[发送异常]'} → {chat_name}: {text} "
+                         f"| {via}{'' if len(texts) == 1 else f' 第{i + 1}/{len(texts)}条'} "
+                         f"{time.time() - t0:.1f}s | resp={resp}")
+                if not ok:
+                    return False, sent
+                if i + 1 < len(texts):
+                    # 连发之间留点间隔，别撞上游库的节奏闸
+                    time.sleep(max(0.0, gap))
+            return True, sent
         except Exception as e:  # noqa: BLE001
             log_line(f"[发送失败] {chat_name}: {type(e).__name__}: {e}")
-            return False
+            return False, 0
+
+
+def do_send_impl(args, get_gui, send_lock, db, text, chat_username, chat_name):
+    """兼容旧调用：发一条。"""
+    return send_multi_impl(get_gui, send_lock, db, [text], chat_username, chat_name)[0]
 
 
 def main():
@@ -595,6 +830,10 @@ def main():
     ap.add_argument("--config", default=CONFIG_PATH)
     ap.add_argument("--dry-run", action="store_true", help="只生成回复，不发送")
     ap.add_argument("--test-reply", default="", help="测试：把该文本当私信走完整流程（发到文件传输助手）")
+    ap.add_argument("--proactive-now", default=None, nargs="?", const="",
+                    help="立刻试一条主动消息（可跟群名；默认只生成不发送）")
+    ap.add_argument("--proactive-send", action="store_true",
+                    help="配合 --proactive-now：真的发出去")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -635,6 +874,36 @@ def main():
             log_line(f"[DRY-RUN] 本应回复「{chat_name}」: {text}")
             return True
         return do_send_impl(args, get_gui, send_lock, db, text, chat_username, chat_name)
+
+    def send_multi(texts, chat_username: str, chat_name: str) -> tuple:
+        """一次发多条（同一个会话只打开一次）。"""
+        texts = [t for t in (texts or []) if (t or "").strip()]
+        if args.dry_run:
+            for t in texts:
+                log_line(f"[DRY-RUN] 本应发送「{chat_name}」: {t}")
+            return True, len(texts)
+        return send_multi_impl(get_gui, send_lock, db, texts, chat_username, chat_name)
+
+    sched = ProactiveScheduler(cfg, db, resolver, policy, send_multi)
+
+    # --proactive-now [群名]：立刻试一条主动消息（默认只生成不发送）
+    if args.proactive_now is not None:
+        who = (args.proactive_now or "").strip()
+        cu = who
+        if who and not _looks_like_wxid(who):
+            try:
+                cu = db.username_by_nickname(who) or db.group_name_to_id(who) or who
+            except Exception:  # noqa: BLE001
+                cu = who
+        if not cu:
+            cu = (sched.chats or [""])[0]
+        if not cu:
+            print("[错误] 没指定群，且 config 里 proactive.chats 是空的")
+            return 1
+        chat_name = db.get_nickname(cu) or cu
+        print(f"主动开话题试跑 → {chat_name}（空闲 {int(_chat_idle_seconds(db, cu) / 60)} 分钟）")
+        sched.run_once(cu, force=True, dry_run=not args.proactive_send)
+        return 0
 
     # --test-reply：模拟一条私信
     if args.test_reply:
@@ -706,19 +975,36 @@ def main():
         if not reply:
             log_line("  AI 未生成回复，跳过")
             return
+        # 一次可以说好几句：开了分隔符就分条发，否则整段一条（多行保留）
+        ms = dict(cfg["ai"].get("multi_send") or {})
+        sep = ms.get("separator", "|||") if ms.get("enabled", True) else ""
+        texts = parse_multi(reply, sep, int(ms.get("max_messages", 3)))
         policy.mark(payload["chat_username"])
-        if do_send(reply, payload["chat_username"], payload["chat_name"]):
+        if sched is not None:
+            sched.note_activity(payload["chat_username"])   # 人在说话，别去主动开话题
+        if send_multi(texts, payload["chat_username"], payload["chat_name"])[0]:
             # 异步更新记忆档案（不阻塞、不影响回复延迟）
             if cfg["ai"].get("memory", {}).get("enabled", True):
                 lines = list(history or [])
                 lines.append(f"{payload['sender']}: {payload['content']}")
-                lines.append(f"我: {reply}")
+                lines.append("我: " + " ".join(texts))
                 threading.Thread(
                     target=memory_store.update,
                     args=(payload["chat_username"], payload["chat_name"], lines,
                           cfg["ai"], load_api_key(), cfg["ai"].get("memory", {})),
                     daemon=True,
                 ).start()
+
+    # 主动开话题：后台线程，只在列进 proactive.chats 的群里说话
+    stop_event = threading.Event()
+    if sched.chats:
+        print(f"主动开话题：{'、'.join(sched.chats)} "
+              f"（空闲 ≥{sched.p.get('min_idle_minutes', 40)} 分钟才开口，"
+              f"每天最多 {sched.p.get('max_per_day', 6)} 次"
+              f"{'，已开启' if sched.p.get('enabled', False) else '，未开启（enabled=false）'}）")
+        if sched.p.get("enabled", False):
+            threading.Thread(target=sched.loop, args=(stop_event, args.dry_run),
+                             daemon=True).start()
 
     lst.add_all(on_msg, discover=True)
     lst.start()
@@ -729,6 +1015,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        stop_event.set()
         lst.stop()
         print("\n已停止。")
     return 0
