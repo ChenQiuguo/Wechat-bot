@@ -752,12 +752,69 @@ def open_chat_via_session_list(gui, name: str, attempts: int = 2) -> tuple:
 # 主动开话题
 # --------------------------------------------------------------------------
 
-def parse_multi(raw, separator: str = "|||", max_parts: int = 0) -> list:
-    """把 AI 输出切成要分开发送的几条。
+_SENT_END = "。！？!?…~"
+_SENT_SOFT = "，,；;、"
 
-    默认不开分隔符（separator 为空）→ 整段作为一条发出，多行保留在单条里。
-    开了分隔符：按它切，条数有上限，丢弃空白段。
+
+def split_sentences(raw: str, max_chars: int = 0, max_parts: int = 0) -> list:
+    """按句号/问号/感叹号/省略号把一段话切成几句，一句一条发。
+
+    设计要点：
+      * 连着的句末符号（如「？！」）留在同一句，不拆成两条；
+      * 被换行分开的短句算独立一句（模型用换行分点时就派上用场）；
+      * 太长的句子（超过 max_chars）再按逗号切，避免一条消息过长；
+      * 超过 max_parts 的部分合并到最后一条，宁可一条长点也不刷屏。
     """
+    text = (raw or "").strip()
+    if not text:
+        return []
+    chunks: list = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        start, i, n = 0, 0, len(line)
+        while i < n:
+            if line[i] in _SENT_END:
+                # 连着的句末符号算同一句：「？！」「……」「！！」都不拆开
+                while i < n and line[i] in _SENT_END:
+                    i += 1
+                seg = line[start:i].strip()
+                if seg:
+                    chunks.append(seg)
+                start = i
+                continue
+            i += 1
+        seg = line[start:].strip()
+        if seg:
+            chunks.append(seg)
+
+    limit = int(max_chars or 0)
+    if limit > 0:
+        out: list = []
+        for c in chunks:
+            buf = c
+            while len(buf) > limit:
+                # 在 [limit, 2*limit) 里找最后一个停顿符：不早于 limit 切（否则切太碎），
+                # 又别拖太重（所以最多放宽到 2*limit）。窗口内没有就整句留着。
+                cut = max(buf.rfind(p, limit, limit * 2) for p in _SENT_SOFT)
+                if cut < 0:
+                    break
+                out.append(buf[: cut + 1].strip())
+                buf = buf[cut + 1:].strip()
+            if buf:
+                out.append(buf)
+        chunks = out
+
+    if max_parts and len(chunks) > max_parts:
+        head = chunks[: max_parts - 1]
+        head.append("".join(chunks[max_parts - 1:]))
+        chunks = head
+    return chunks
+
+
+def parse_multi(raw, separator: str = "|||", max_parts: int = 0) -> list:
+    """按分隔符切分（显式分条模式）。separator 为空 → 整段一条，多行保留。"""
     text = (raw or "").strip()
     if not text:
         return []
@@ -771,6 +828,36 @@ def parse_multi(raw, separator: str = "|||", max_parts: int = 0) -> list:
         head.append(separator.join(parts[max_parts - 1:]).replace(separator, " "))
         parts = head
     return parts
+
+def split_for_send(raw: str, msc: dict) -> list:
+    """按配置把一段回复切成要分开发的几条。
+
+    ``msc`` 就是 ``ai.multi_send`` 那一坨：
+      * ``mode: "sentence"``（默认）→ 按句子切，一句一条，更像真人打字；
+      * ``mode: "separator"`` → 只在模型写了分隔符（默认 ``|||``）的地方切；
+      * 分隔符无论哪种模式都**优先**当硬分界：模型想合并短句时写 ``|||`` 就行。
+    """
+    msc = dict(msc or {})
+    on = msc.get("enabled", True)
+    sep = (msc.get("separator", "|||") or "") if on else ""
+    mode = (msc.get("mode") or "sentence") if on else "off"
+    mx = int(msc.get("max_messages", 4) or 0)
+    if mode == "off" or not on:
+        return parse_multi(raw, "", 0)
+    parts = parse_multi(raw, sep, 0) if sep else [(raw or "").strip()]
+    out: list = []
+    for p in parts:
+        if mode == "sentence":
+            out.extend(split_sentences(p, int(msc.get("max_chars_per_message", 90) or 0), 0))
+        else:
+            out.append(p)
+    out = [t for t in out if t]
+    if mx and len(out) > mx:
+        head = out[: mx - 1]
+        head.append("".join(out[mx - 1:]))
+        out = head
+    return out
+
 
 def _resp_ok(resp) -> bool:
     ok = bool(getattr(resp, "is_success", None))
@@ -868,8 +955,7 @@ def main():
                 reply = unsolicited_fill(qai, me0, chat_name, "群友", qa.can_answer, hist,
                                          api_key=qkey)
                 ms = dict(qcfg["ai"].get("multi_send") or {})
-                sep = ms.get("separator", "|||") if ms.get("enabled", True) else ""
-                texts = parse_multi(reply, sep, int(ms.get("max_messages", 3)))
+                texts = split_for_send(reply, ms)
                 print(f"  生成 {len(texts)} 条：")
                 for i, t in enumerate(texts, 1):
                     print(f"     ({i}) {t}")
@@ -1017,7 +1103,6 @@ def main():
                      f"{payload['sender']} 问：{payload['content']}")
 
         ms = dict(cfg["ai"].get("multi_send") or {})
-        sep = ms.get("separator", "|||") if ms.get("enabled", True) else ""
         me_name = info.get("nick_name") or ""
 
         if unsolicited:
@@ -1033,8 +1118,8 @@ def main():
         if not reply:
             log_line("  AI 未生成回复，跳过")
             return
-        # 一次可以说好几句：开了分隔符就分条发，否则整段一条（多行保留）
-        texts = parse_multi(reply, sep, int(ms.get("max_messages", 3)))
+        # 一句一条发（模式见 ai.multi_send）；想整段一条就把 enabled 关掉
+        texts = split_for_send(reply, ms)
         policy.mark(payload["chat_username"])
         if unsolicited:
             uns.mark(payload["chat_username"])

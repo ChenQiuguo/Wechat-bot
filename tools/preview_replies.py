@@ -71,11 +71,10 @@ for sender, chat_name, is_group, text, history in CASES:
     print(f"[{'群' if is_group else '私'}] {sender}: {text}")
     if USE_HISTORY and history:
         print(f"     （上下文 {len(history)} 条）")
-    # 开了 multi_send 就按同一规则切分，看得出一条会不会分成好几条发
-    ms = cfg.get("multi_send") or {}
-    parts = wx_bot.parse_multi(reply, _sep(cfg), int(ms.get("max_messages", 1)))
+    # 按真实发送规则切分（默认一句一条），看得出实际会发几条
+    parts = wx_bot.split_for_send(reply, cfg.get("multi_send") or {})
     if len(parts) > 1:
-        print(f"  → 会分 {len(parts)} 条发：")
+        print(f"  → 会一句一条发 {len(parts)} 条：")
         for i, p in enumerate(parts, 1):
             print(f"     ({i}) {p}")
     else:
