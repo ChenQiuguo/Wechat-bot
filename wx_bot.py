@@ -303,56 +303,118 @@ def log_line(line: str):
         f.write(line + "\n")
 
 
-def open_chat_via_session_list(gui, name: str) -> bool:
+def _looks_like_wxid(s: str) -> bool:
+    s = (s or "").strip()
+    return s.startswith("wxid_") or s.startswith("gh_") or s.endswith("@chatroom")
+
+
+def resolve_display_names(db, chat_username: str, chat_name: str) -> list:
+    """收集能拿去和「会话列表」匹配的显示名候选。
+
+    会话列表里显示的是昵称/备注，不是 wxid。如果昵称解析失败（拿到的是
+    wxid），拿它去匹配永远匹配不上——所以这里多做一次数据库反查。
+    """
+    cands = []
+
+    def add(n):
+        n = (n or "").strip()
+        if n and not _looks_like_wxid(n) and n not in cands:
+            cands.append(n)
+
+    add(chat_name)
+    if cands or db is None:
+        return cands
+
+    for probe in (chat_username, chat_name):
+        probe = (probe or "").strip()
+        if not probe:
+            continue
+        try:
+            add(db.get_nickname(probe) or "")
+        except Exception:
+            pass
+        try:
+            for h in (db.search_contact(probe) or [])[:3]:
+                add(h.get("nick_name") or h.get("remark") or "")
+        except Exception:
+            pass
+    return cands
+
+
+def open_chat_via_session_list(gui, name: str, attempts: int = 2) -> tuple:
     """用 UIA 读左侧会话列表并直接点开目标会话。
 
-    比"打开搜索框 → 输入关键词 → 等搜索结果 → 点结果"快得多，而且不用 DB
-    反查昵称；刚来消息的会话通常就在列表顶部。
+    返回 (是否成功, 原因)。原因会写进日志，方便诊断为什么会回退到搜索。
     """
     target = (name or "").strip()
     if not target:
-        return False
-    try:
-        uia = gui._get_uia()  # noqa: SLF001
-        if uia is None or not uia.ensure_window():
-            return False
-        node = _find_by(uia._win,  # noqa: SLF001
-                        lambda c: _aid_hit(getattr(c, "AutomationId", ""), SESSION_LIST_AIDS))
-        if node is None:
-            return False
-        exact, fuzzy = [], []
-        for item in node.GetChildren():
-            first = (item.Name or "").split("\n")[0].strip()
-            if first == target:
-                exact.append(item)
-            elif first and (first.startswith(target) or target.startswith(first)):
-                fuzzy.append(item)
-        chosen = exact or fuzzy
-        if len(chosen) != 1:      # 会话名重复/无命中 → 不猜，交给搜索兜底
-            return False
-        rect = chosen[0].BoundingRectangle
-        uia._click_at((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2)  # noqa: SLF001
-        time.sleep(0.5)
-        cur = uia.current_chat() or ""
-        return bool(cur) and (cur.startswith(target) or target in cur)
-    except Exception as e:  # noqa: BLE001
-        print(f"  [会话列表点击异常] {type(e).__name__}: {e}", flush=True)
-        return False
+        return False, "目标名为空"
+    if _looks_like_wxid(target):
+        return False, "目标名是 wxid（列表里是昵称，匹配不上）"
+
+    last = "未知原因"
+    for i in range(max(1, attempts)):
+        try:
+            uia = gui._get_uia()  # noqa: SLF001
+            if uia is None:
+                last = "UIA 不可用"
+            elif not uia.ensure_window():
+                # 微信重启后热激活标记会归零；ensure_window 内部会重新激活，
+                # 但首次可能赶不上，所以循环里再给它一次机会
+                last = "UIA 树未就绪（热激活中）"
+            else:
+                node = _find_by(uia._win,  # noqa: SLF001
+                                lambda c: _aid_hit(getattr(c, "AutomationId", ""), SESSION_LIST_AIDS))
+                if node is None:
+                    last = "找不到会话列表控件"
+                else:
+                    exact, fuzzy = [], []
+                    for item in node.GetChildren():
+                        first = (item.Name or "").split("\n")[0].strip()
+                        if first == target:
+                            exact.append(item)
+                        elif first and (first.startswith(target) or target.startswith(first)):
+                            fuzzy.append(item)
+                    chosen = exact or fuzzy
+                    if not chosen:
+                        last = f"列表里没有「{target}」"
+                    elif len(chosen) > 1:
+                        last = f"「{target}」命中 {len(chosen)} 个会话，不猜"
+                    else:
+                        rect = chosen[0].BoundingRectangle
+                        uia._click_at((rect.left + rect.right) // 2,  # noqa: SLF001
+                                      (rect.top + rect.bottom) // 2)
+                        time.sleep(0.5)
+                        cur = uia.current_chat() or ""
+                        if cur and (cur.startswith(target) or target in cur):
+                            return True, "OK"
+                        last = f"点开后当前会话是「{cur[:16]}」，不是目标"
+        except Exception as e:  # noqa: BLE001
+            last = f"异常 {type(e).__name__}: {e}"
+        if i + 1 < attempts:
+            time.sleep(1.0)
+    return False, last
 
 
-def do_send_impl(args, get_gui, send_lock, text, chat_username, chat_name):
-    """实际发送：优先「会话列表点击」，失败回退「搜索框」。"""
-    who = chat_name or chat_username
+def do_send_impl(args, get_gui, send_lock, db, text, chat_username, chat_name):
+    """实际发送：优先「会话列表点击」，失败回退「搜索框」（并把原因写进日志）。"""
     with send_lock:
         t0 = time.time()
         try:
             gui = get_gui()
-            if open_chat_via_session_list(gui, who):
+            names = resolve_display_names(db, chat_username, chat_name)
+            opened, why = False, "没有可用的显示名"
+            for n in names:
+                opened, why = open_chat_via_session_list(gui, n)
+                if opened:
+                    break
+            if opened:
                 resp = gui.send_msg(text, None, False)   # 已确认打开 → 跳过打开步骤
                 via = "列表点击"
             else:
+                who = names[0] if names else (chat_name or chat_username)
                 resp = gui.send_msg(text, who, False)     # 回退：搜索框
-                via = "搜索回退"
+                via = f"搜索回退[{why}]"
             ok = bool(getattr(resp, "is_success", None))
             if not ok and isinstance(resp, dict):
                 ok = resp.get("status") == "成功"
@@ -405,7 +467,7 @@ def main():
         if args.dry_run:
             log_line(f"[DRY-RUN] 本应回复「{chat_name}」: {text}")
             return True
-        return do_send_impl(args, get_gui, send_lock, text, chat_username, chat_name)
+        return do_send_impl(args, get_gui, send_lock, db, text, chat_username, chat_name)
 
     # --test-reply：模拟一条私信
     if args.test_reply:

@@ -51,10 +51,10 @@ def main():
                 resp = gui.send_msg(text, TARGET, False)
                 detail = ""
             else:
-                opened = open_chat_via_session_list(gui, TARGET)
+                opened, why = open_chat_via_session_list(gui, TARGET)
                 t_open = time.time() - t
                 resp = gui.send_msg(text, None, False) if opened else gui.send_msg(text, TARGET, False)
-                detail = f"打开={'OK' if opened else '失败'}({t_open:.1f}s)"
+                detail = f"打开={'OK' if opened else '失败:' + why}({t_open:.1f}s)"
             dt = time.time() - t
             results[label].append(dt)
             print(f"[{i}] {label:<3} {dt:5.1f}s  {'成功' if ok_of(resp) else '失败'}  {detail}", flush=True)
