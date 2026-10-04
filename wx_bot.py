@@ -227,6 +227,98 @@ def ai_reply(cfg: dict, content: str, sender: str, chat_name: str, is_group: boo
 
 
 # --------------------------------------------------------------------------
+# 「@我 / 提到我 / 话题轮到我」判定
+# --------------------------------------------------------------------------
+
+# 消息里这些词说明对方在叫某人、或在问句，才值得让模型判一次「是不是在叫我」
+_ADDRESS_WORDS = ("你", "您", "问下", "问一下", "请教", "我说", "我觉得", "帮我",
+                  "回答", "说句话", "说话", "出来", "在吗", "在么", "搞啥", "干嘛", "干啥")
+
+
+def _mentions_name(text: str, names, name_owner: dict) -> bool:
+    """正文里是否出现了「我的名字」，且这个名字不是别人正在被叫的名字。
+
+    实测群正文形如 ``wxid_xxx:\\n正文``，@ 前的文本是 '@'，
+    所以直接子串匹配即可（不要求前面有 @）。
+    """
+    t = text or ""
+    for n in names:
+        n = (n or "").strip()
+        if not n or n not in t:
+            continue
+        # 群里还有别人叫这个名字（也含该串）时不认，避免张冠李戴
+        others = [o for o in name_owner.get(n, ()) if o != n]
+        if others:
+            stripped = t
+            for o in sorted(others, key=len, reverse=True):
+                stripped = stripped.replace(o, "")
+            if n not in stripped:
+                continue
+        return True
+    return False
+
+
+def _judge_user_prompt(me_names, chat_name: str, sender: str, text: str, recent) -> str:
+    names = "、".join(n for n in dict.fromkeys(me_names) if n)
+    lines = []
+    if recent:
+        lines.append("最近的群聊记录（最后一条就是刚收到的这条）：")
+        lines.extend(recent)
+        lines.append("")
+    lines.append(f"刚收到的一条：{sender}: {text}")
+    return (
+        f"你在判断微信群「{chat_name}」里刚收到的这条消息是不是在说「{names}」（即本人）。\n\n"
+        + "\n".join(lines) + "\n\n"
+        "规则：\n"
+        f"1. 对方 @ 了{names}、直接叫这个名字、或用「你」对着这个名字的主人说话 → 是；\n"
+        f"2. 上文在谈论{names}，这条接着问关于这个人的事 → 是。**代词也算**："
+        "上文刚提到这个名字，这条里的「他/她/他自己」指的就是这个人；\n"
+        f"3. 只是顺口提到这个名字、别人之间对话把这个人当第三方案例或比较对象、"
+        f"或者原话就是在说「跟{names}没关系」 → 否；\n"
+        "4. 拿不准就答否。\n\n"
+        "只输出一个字：是 或 否。"
+    )
+
+
+def judge_targeted(cfg: dict, me_names, chat_name: str, sender: str,
+                   text: str, recent, api_key: str = "") -> bool:
+    """便宜的一次判定：这条消息该不该由我回应。失败一律返回 False（宁可不回）。"""
+    key = api_key or load_api_key()
+    if not key:
+        return False
+    jc = cfg.get("judge") or {}
+    body = {
+        "model": jc.get("model") or cfg.get("model", "deepseek-flash"),
+        "messages": [
+            {"role": "system", "content": "你是一个严格的消息归类器，只输出「是」或「否」，不要任何解释。"},
+            {"role": "user", "content": _judge_user_prompt(me_names, chat_name, sender, text, recent)},
+        ],
+        "max_tokens": int(jc.get("max_tokens", 16)),
+        # 实测坑：deepseek-flash 默认开思考，思维链会把 max_tokens 吃光、
+        # content 返回空串，判定就永远失败。判定这种二选一必须显式关掉思考。
+        "thinking": {"type": "disabled"},
+        "stream": False,
+    }
+    req = urllib.request.Request(
+        cfg["base_url"].rstrip("/") + "/chat/completions",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=jc.get("timeout", 12)) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        out = (data["choices"][0]["message"]["content"] or "").strip()
+        if not out:
+            print("  [相关判定] 返回为空，按「无关」处理（检查 judge.max_tokens / thinking）", flush=True)
+            return False
+        return out.startswith("是")
+    except Exception as e:  # noqa: BLE001
+        print(f"  [相关判定失败] {type(e).__name__}: {e}", flush=True)
+        return False
+
+
+# --------------------------------------------------------------------------
 # 回复策略
 # --------------------------------------------------------------------------
 
@@ -245,10 +337,23 @@ class ReplyPolicy:
         self._count_today = 0
         self._day = time.strftime("%Y-%m-%d")
         self.at_names = list(self.trig.get("at_names") or [])
-        me = db.get_self_info() or {}
+        self.name_hits: list = []
+        self.api_key = ""
+        self.judge_calls = 0
+        self._last_judge: dict = {}
+        self._judge_cache: dict = {}
+        me = {}
+        try:
+            me = db.get_self_info() or {}
+        except Exception as e:  # noqa: BLE001
+            print(f"  [警告] 取自身昵称失败：{type(e).__name__}: {e}", flush=True)
         for n in (me.get("nick_name"),):
             if n and n not in self.at_names:
                 self.at_names.append(n)
+        # 没被 @ 也可能是在叫我：昵称/别名 + 别人平时怎么称呼我
+        for n in list(self.trig.get("name_hits") or []) + self.at_names:
+            if isinstance(n, str) and n and n not in self.name_hits:
+                self.name_hits.append(n)
 
     def _bump_day(self):
         today = time.strftime("%Y-%m-%d")
@@ -256,7 +361,34 @@ class ReplyPolicy:
             self._day = today
             self._count_today = 0
 
-    def check(self, payload: dict) -> tuple:
+    def _context_judge(self, payload: dict, recent) -> bool:
+        """用一次便宜的模型调用判断这条群消息是不是在说我（结果缓存，避免重复判定）。"""
+        if not self.trig.get("context_judge", False):
+            return False
+        recent = list(recent or [])
+        lookback = int(self.trig.get("context_lookback", 8))
+        now = time.time()
+        cd = float(self.trig.get("judge_cooldown", 8))
+        with self._lock:
+            last = self._last_judge.get(payload["chat_username"], 0)
+            if now - last < cd:
+                return False
+            key = (payload["chat_username"], payload.get("content", ""))
+            cached = self._judge_cache.get(key)
+            if cached is not None:
+                return cached
+        self._last_judge[payload["chat_username"]] = now
+        self.judge_calls += 1
+        hit = judge_targeted(self.cfg["ai"], self.name_hits, payload["chat_name"],
+                             payload["sender"], payload["content"],
+                             recent[-lookback:], self.api_key)
+        with self._lock:
+            if len(self._judge_cache) > 500:
+                self._judge_cache.clear()
+            self._judge_cache[key] = hit
+        return hit
+
+    def check(self, payload: dict, recent=None) -> tuple:
         """返回 (是否回复, 原因)。"""
         if payload["is_self"]:
             return False, "自己发的"
@@ -279,9 +411,26 @@ class ReplyPolicy:
             if not self.trig.get("group_at", True):
                 return False, "群聊未开启"
             text = payload["content"]
-            hit = next((n for n in self.at_names if f"@{n}" in text), None)
-            if not hit:
-                return False, "群里没@我"
+            name_owner: dict = {}
+            try:
+                for nm in self.resolver.roster(payload["chat_username"]).values():
+                    nm = (nm or "").strip()
+                    if nm:
+                        name_owner.setdefault(nm, []).append(nm)
+            except Exception:  # noqa: BLE001
+                name_owner = {}
+            # ① 直接 @ 我：最高优先，一定回（哪怕正文里还 @ 了别人）
+            at_me = next((n for n in self.at_names if f"@{n}" in text), None) or \
+                next((n for n in self.name_hits if f"@{n}" in text), None)
+            if not at_me:
+                # ② 只是「可能跟我有关」才值得花一次便宜的判定；
+                #    光出现我的名字不算——可能是顺口提到，或原话就跟我无关
+                cand = _mentions_name(text, self.name_hits, name_owner) \
+                    or _mentions_name(" ".join(recent or []), self.name_hits, name_owner) \
+                    or any(w in text for w in _ADDRESS_WORDS) \
+                    or text.endswith(("?", "？"))
+                if not (cand and self._context_judge(payload, recent)):
+                    return False, "群里没@我"
         elif not self.trig.get("private", True):
             return False, "私聊未开启"
 
@@ -462,11 +611,14 @@ def main():
     db = WeChatDB()
     resolver = SenderResolver(db)
     info = db.get_self_info()
-    policy = ReplyPolicy(cfg, resolver, db)
 
-    if not load_api_key():
+    api_key = load_api_key()
+    if not api_key:
         print("[错误] 没拿到 DEEPSEEK_API_KEY（环境变量或 ~/.dsh/.credentials.yaml）")
         return 1
+
+    policy = ReplyPolicy(cfg, resolver, db)
+    policy.api_key = api_key
 
     # 发送端：只初始化一次，避免每次发送都重新校准布局
     sender = {"gui": None}
@@ -503,6 +655,9 @@ def main():
     print(f"账号：{info.get('nick_name')} ({info.get('username')})")
     print(f"策略：私聊={cfg['trigger']['private']} 群@={cfg['trigger']['group_at']} "
           f"@{policy.at_names} 冷却={cfg['limits']['per_chat_cooldown']}s 节奏={cfg.get('rhythm')}")
+    if cfg["trigger"].get("context_judge"):
+        print(f"群内额外触发：提到「{'、'.join(policy.name_hits)}」即回；"
+              f"话题相关时再用一次轻量判定（回看 {cfg['trigger'].get('context_lookback', 8)} 条）")
     print(f"模式：{'DRY-RUN（不发送）' if args.dry_run else '正式（会真的发送）'}")
     print(f"回复日志 → {REPLY_LOG}\n", flush=True)
 
@@ -510,17 +665,18 @@ def main():
 
     def on_msg(msg: dict, _lst: Listener):
         payload = build_payload(db, resolver, msg)
-        ok, reason = policy.check(payload)
+        # 上下文先取好：既给「是不是在说我」判定用，也给正式生成回复用
+        history = build_history(
+            db, resolver, payload["chat_username"],
+            int(cfg["ai"].get("history_limit", 8)), msg.get("local_id"),
+        )
+        ok, reason = policy.check(payload, history)
         if not ok:
             # 常见情况静默（否则群里每条消息都刷一行），只报异常原因
             if reason not in QUIET_REASONS and not reason.startswith("非文本"):
                 print(f"  · 跳过 {payload['chat_name']} | {reason}", flush=True)
             return
         log_line(f"[{payload['time']}] 收到 {payload['chat_name']} | {payload['sender']}: {payload['content']}")
-        history = build_history(
-            db, resolver, payload["chat_username"],
-            int(cfg["ai"].get("history_limit", 8)), msg.get("local_id"),
-        )
         # 注入该会话的记忆档案（没有就是空串）
         mem_block = ""
         if cfg["ai"].get("memory", {}).get("enabled", True):
