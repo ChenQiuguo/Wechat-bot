@@ -26,7 +26,7 @@
       "save_dir": "",
       "private_require_recent": false,
       "recent_window_seconds": 1800,
-      "group_recent_seconds": 0
+      "group_recent_seconds": 300
     },
     "multi_send": {
       "enabled": true,
@@ -46,7 +46,7 @@
     "context_lookback": 8,
     "judge_cooldown": 8,
     "types": ["文本", "图片"],
-    "group_image": false,
+    "group_image": true,
     "max_age_seconds": 120
   },
   "limits": {

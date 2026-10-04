@@ -23,7 +23,7 @@
 | 群聊 @ 自动回复 | 自动识别 `@本账号昵称` |
 | **提到名字也回** | 没被 @、但正文里叫了本账号的名字，或接着上文问关于他的事，也会接话（靠一次轻量判定，拿不准就答否） |
 | **主动接问题** | 群里没人点他，但有人问了个他确实答得上来的具体问题，会主动接一句；答不上来或只是闲聊就不插话（默认关闭） |
-| **看图** | 对方**发图片**也能看懂（截图、照片、图表里的字都认）。图片从本地缓存解密，**不点开图片、不驱动界面**；默认私聊接图、群里不接（默认关闭） |
+| **看图** | 对方**发图片**也能看懂（截图、照片、图表里的字都认）。图片从本地缓存解密，**不点开图片、不驱动界面**；私聊直回，群里只在「这个群最近 300 秒有人说话」时接（默认关闭，见配置） |
 | **一句一条** | 回复按句子自动拆开、一句一条发出去，像真人打字；可切回「整段一条」 |
 | **不碰剪贴板** | 发送走 `SendInput` Unicode 逐字注入，**不写系统剪贴板**（对开了剪贴板多端同步的人很重要） |
 | **思考模式** | 回复前先推理（思维链），回答更有条理；可用 `reasoning_effort` 调强度 |
@@ -79,7 +79,7 @@ pip install -r requirements.txt
       "save_dir": "",
       "private_require_recent": false,
       "recent_window_seconds": 1800,
-      "group_recent_seconds": 0
+      "group_recent_seconds": 300
     }
   },
   "input": {
@@ -96,7 +96,7 @@ pip install -r requirements.txt
     "context_judge": true,
     "context_lookback": 8,
     "types": ["文本", "图片"],
-    "group_image": false,
+    "group_image": true,
     "max_age_seconds": 120
   },
   "limits": {
@@ -125,7 +125,8 @@ pip install -r requirements.txt
 | `trigger.context_judge` | 没人点你时，是否花一次轻量判定决定「要不要接话」 |
 | `unsolicited.enabled` | 群里有人问了能答的问题时是否**主动**接一句（默认关，开了也只在群聊、私聊永不主动） |
 | `ai.image.enabled` | 是否**看图**：对方发图片时把图片内容一起给模型（默认关；视觉调用比文本贵，1 张图≈1000 token） |
-| `trigger.group_image` | 群里收到图片是否也接（默认关——图片没有 @，开了就是「整群图片都看」；可再配合 `ai.image.group_recent_seconds` 只接正在聊的群） |
+| `trigger.group_image` | 群里收到图片是否也接（开了之后，只在「这个群 300 秒内有人说过话」时才接，见下一行） |
+| `ai.image.group_recent_seconds` | 群图片的活跃窗口（默认 300）：只接**正在进行**的对话；设 0 = 不限（群里每张图都看，费 token） |
 | `ai.image.detail` | `low`（默认，先缩到 512×512，快且省）／`original`（要看清小字时用） |
 
 **API Key** 按顺序从这些位置找（都不会被写进仓库）：
