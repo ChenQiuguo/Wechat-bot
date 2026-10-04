@@ -1074,14 +1074,13 @@ def main():
             except Exception:  # noqa: BLE001
                 cu = qa.chat.strip()
         if not cu:
-            print("[错误] --can-answer 需要配 --chat 群名（或群 wxid）")
-            return 1
+            cu = "filehelper"          # 默认沙盒：文件传输助手，绝不发到真人会话
         chat_name = db0.get_nickname(cu) or cu
         hist = build_history(db0, res0, cu, int(qcfg["ai"].get("history_limit", 8)))
-        print(f"群「{chat_name}」收到：{qa.can_answer}")
+        print(f"会话「{chat_name}」收到：{qa.can_answer}")
         print(f"  粗筛像是问题：{looks_like_question(qa.can_answer)}")
         if qa.can_answer_send:
-            print("  ⚠ --can-answer-send 已开，判定为「接」时会真的发到群里")
+            print(f"  ⚠ --can-answer-send 已开，判定为「接」时会真的发到「{chat_name}」")
         if looks_like_question(qa.can_answer):
             qai = _with_key(qcfg["ai"], qkey)
             hit = can_answer_question(qai, [me0], chat_name, "群友", qa.can_answer, hist,
@@ -1096,15 +1095,20 @@ def main():
                 for i, t in enumerate(texts, 1):
                     print(f"     ({i}) {t}")
                 if qa.can_answer_send:
-                    box = {"gui": None}
+                    if cu == "filehelper":
+                        box = {"gui": None}
 
-                    def _gui():
-                        if box["gui"] is None:
-                            from wechatauto.guia import WeChatGUI
-                            box["gui"] = WeChatGUI()
-                        return box["gui"]
+                        def _gui():
+                            if box["gui"] is None:
+                                from wechatauto.guia import WeChatGUI
+                                box["gui"] = WeChatGUI()
+                            return box["gui"]
 
-                    send_multi_impl(_gui, threading.Lock(), db0, texts, cu, chat_name)
+                        send_multi_impl(_gui, threading.Lock(), db0, texts, cu, chat_name)
+                    else:
+                        # 测试消息不许发到任何真人会话（用户明确要求）
+                        print(f"  ⚠ 拒绝发送：测试只允许发到「文件传输助手」，"
+                              f"当前目标是「{chat_name}」")
         return 0
 
     ap = argparse.ArgumentParser(description="微信 AI 自动回复机器人")
