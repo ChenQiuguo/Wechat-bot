@@ -4,6 +4,9 @@ bot_replies.log
 wechat_messages.log
 wx_messages.jsonl
 
+# 联系人记忆（含聊天内容，绝不提交）
+memory/
+
 # 密钥（千万不要提交）
 apikey.txt
 .env

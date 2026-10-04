@@ -46,10 +46,14 @@ body = {
         {"role": "system", "content": cfg["system_prompt"]},
         {"role": "user", "content": prompt},
     ],
-    "max_tokens": cfg.get("max_tokens", 200),
-    "temperature": cfg.get("temperature", 1.2),
+    "max_tokens": cfg.get("max_tokens", 400),
     "stream": False,
 }
+if cfg.get("thinking", False):
+    body["thinking"] = {"type": "enabled"}
+    body["reasoning_effort"] = cfg.get("reasoning_effort", "high")
+else:
+    body["temperature"] = cfg.get("temperature", 1.2)
 
 req = urllib.request.Request(
     cfg["base_url"].rstrip("/") + "/chat/completions",

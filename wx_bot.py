@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from wechatauto.db import WeChatDB, Listener
 from wechatauto.uia_driver import SESSION_LIST_AIDS, _aid_hit, _find_by
+import memory_store
 from wx_push import SenderResolver, build_payload, clean_content, fmt_time, _as_text
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -165,7 +166,7 @@ def build_history(db: WeChatDB, resolver: "SenderResolver", chat_username: str,
 
 
 def ai_reply(cfg: dict, content: str, sender: str, chat_name: str, is_group: bool,
-             history=None, me_name: str = "") -> str:
+             history=None, me_name: str = "", mem_block: str = "") -> str:
     key = load_api_key()
     if not key:
         return ""
@@ -180,7 +181,12 @@ def ai_reply(cfg: dict, content: str, sender: str, chat_name: str, is_group: boo
     ctx = ""
     if history:
         ctx = "最近的聊天记录（最后一条就是刚收到的）：\n" + "\n".join(history) + "\n\n"
-    user_prompt = f"{ident}{ctx}{who} 刚发来：{content}"
+    parts = [ident]
+    if mem_block:
+        parts.append(mem_block.strip() + "\n\n")
+    parts.append(ctx)
+    parts.append(f"{who} 刚发来：{content}")
+    user_prompt = "".join(parts)
 
     body = {
         "model": cfg["model"],
@@ -188,10 +194,15 @@ def ai_reply(cfg: dict, content: str, sender: str, chat_name: str, is_group: boo
             {"role": "system", "content": cfg["system_prompt"]},
             {"role": "user", "content": user_prompt},
         ],
-        "max_tokens": cfg.get("max_tokens", 60),
-        "temperature": cfg.get("temperature", 1.2),
+        "max_tokens": cfg.get("max_tokens", 400),
         "stream": False,
     }
+    if cfg.get("thinking", False):
+        # 思考模式：先出思维链再出答案；注意该模式下 temperature 会被忽略
+        body["thinking"] = {"type": "enabled"}
+        body["reasoning_effort"] = cfg.get("reasoning_effort", "high")
+    else:
+        body["temperature"] = cfg.get("temperature", 1.2)
     req = urllib.request.Request(
         cfg["base_url"].rstrip("/") + "/chat/completions",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -510,13 +521,35 @@ def main():
             db, resolver, payload["chat_username"],
             int(cfg["ai"].get("history_limit", 8)), msg.get("local_id"),
         )
+        # 注入该会话的记忆档案（没有就是空串）
+        mem_block = ""
+        if cfg["ai"].get("memory", {}).get("enabled", True):
+            try:
+                mem_block = memory_store.prompt_block(memory_store.load(payload["chat_username"]))
+            except Exception as e:  # noqa: BLE001
+                print(f"  [读取记忆失败] {type(e).__name__}: {e}", flush=True)
+        if mem_block:
+            print(f"  · 已注入 {payload['chat_name']} 的记忆档案", flush=True)
+
         reply = ai_reply(cfg["ai"], payload["content"], payload["sender"], payload["chat_name"],
-                         payload["is_group"], history, me_name=info.get("nick_name") or "")
+                         payload["is_group"], history, me_name=info.get("nick_name") or "",
+                         mem_block=mem_block)
         if not reply:
             log_line("  AI 未生成回复，跳过")
             return
         policy.mark(payload["chat_username"])
-        do_send(reply, payload["chat_username"], payload["chat_name"])
+        if do_send(reply, payload["chat_username"], payload["chat_name"]):
+            # 异步更新记忆档案（不阻塞、不影响回复延迟）
+            if cfg["ai"].get("memory", {}).get("enabled", True):
+                lines = list(history or [])
+                lines.append(f"{payload['sender']}: {payload['content']}")
+                lines.append(f"我: {reply}")
+                threading.Thread(
+                    target=memory_store.update,
+                    args=(payload["chat_username"], payload["chat_name"], lines,
+                          cfg["ai"], load_api_key(), cfg["ai"].get("memory", {})),
+                    daemon=True,
+                ).start()
 
     lst.add_all(on_msg, discover=True)
     lst.start()
