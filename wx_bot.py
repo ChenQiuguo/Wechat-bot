@@ -995,7 +995,7 @@ def main():
 
     def on_msg(msg: dict, _lst: Listener):
         payload = build_payload(db, resolver, msg)
-        # 上下文先取好：既给「是不是在说我」判定用，也给生成回复用
+        # 上下文只取一次（排除刚收到的这条，别重复喂给模型）；三处判定/生成共用
         history = build_history(
             db, resolver, payload["chat_username"],
             int(cfg["ai"].get("history_limit", 8)), msg.get("local_id"),
@@ -1007,10 +1007,10 @@ def main():
             ok, ureason = uns.check(payload, history, uns.api_key)
             if not ok:
                 # 常见情况静默（否则群里每条消息都刷一行），只报异常原因
+                extra = "" if ureason in ("不是在问问题", "主动接话未开启", "私聊不主动") \
+                    else " / 主动接话：" + ureason
                 if reason not in QUIET_REASONS and not reason.startswith("非文本"):
-                    print(f"  · 跳过 {payload['chat_name']} | {reason}"
-                          f"{'' if ureason in ('不是在问问题', '主动接话未开启', '私聊不主动')
-                             else ' / 主动接话：' + ureason}", flush=True)
+                    print(f"  · 跳过 {payload['chat_name']} | {reason}{extra}", flush=True)
                 return
             unsolicited = True
             log_line(f"[{payload['time']}] 主动接话 {payload['chat_name']} | "
@@ -1023,18 +1023,13 @@ def main():
         if unsolicited:
             reply = unsolicited_fill(cfg["ai"], me_name, payload["chat_name"],
                                      payload["sender"], payload["content"], history,
-                                     build_mem_block(payload))
+                                     build_mem_block(payload), api_key=api_key)
         else:
-            if not history:
-                history = build_history(
-                    db, resolver, payload["chat_username"],
-                    int(cfg["ai"].get("history_limit", 8)), msg.get("local_id"),
-                )
             log_line(f"[{payload['time']}] 收到 {payload['chat_name']} | "
                      f"{payload['sender']}: {payload['content']}")
             reply = ai_reply(cfg["ai"], payload["content"], payload["sender"], payload["chat_name"],
                              payload["is_group"], history, me_name=me_name,
-                             mem_block=build_mem_block(payload))
+                             mem_block=build_mem_block(payload), api_key=api_key)
         if not reply:
             log_line("  AI 未生成回复，跳过")
             return
