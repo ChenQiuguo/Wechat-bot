@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from wechatauto.db import WeChatDB, Listener
 from wechatauto.uia_driver import SESSION_LIST_AIDS, _aid_hit, _find_by
+import kb_input
 import memory_store
 from wx_push import SenderResolver, build_payload, clean_content, fmt_time, _as_text
 
@@ -504,6 +505,114 @@ class UnsolicitedPolicy:
         return (f"主动接问题：{'开' if self.u.get('enabled') else '关'} "
                 f"（群里有人问了能答的问题就接；同群间隔 ≥{int(self.u.get('per_chat_cooldown', 480)) // 60} 分钟，"
                 f"每天 ≤{self.u.get('max_per_day', 10)} 次，私聊不主动）")
+
+
+# --------------------------------------------------------------------------
+# 不用剪贴板发送（用户开了剪贴板同步，粘贴会把回复同步到其它设备）
+# --------------------------------------------------------------------------
+
+def input_cfg(cfg: dict) -> dict:
+    ic = dict(cfg.get("input") or {})
+    ic.setdefault("method", "unicode")          # unicode | auto | clipboard
+    ic.setdefault("char_delay", 0.012)
+    ic.setdefault("fallback_clipboard", True)   # 注入失败时才允许碰剪贴板（auto 模式）
+    return ic
+
+
+def install_input_patch(ic: dict) -> str:
+    """给上游库的发送路径打补丁：优先 Unicode 注入，绕开剪贴板。
+
+    覆盖两条路径：
+      * ``WeChatUIA.send_text`` → 内部 ``_paste_into``（UIA 快路径，实际在跑的那条）
+      * ``WeChatGUI.input_text`` → OCR 回退路径的剪贴板粘贴
+    method='clipboard' 时完全不打补丁。返回人话描述的生效模式。
+    """
+    mode = str(ic.get("method", "unicode")).lower()
+    if mode == "clipboard":
+        kb_input.set_unicode_typing(False)
+        return "剪贴板粘贴（未启用 Unicode 注入）"
+    kb_input.set_unicode_typing(True)
+    allow_cb = bool(ic.get("fallback_clipboard", True)) and mode != "unicode"
+    delay = float(ic.get("char_delay", 0.012) or 0.012)
+
+    from wechatauto.guia import WeChatGUI
+    from wechatauto.uia_driver import WeChatUIA
+
+    def _patch_paste_into():
+        orig = WeChatUIA._paste_into
+        if getattr(orig, "_dsh_unicode", False):
+            return                                    # 已经打过，别套娃
+
+        def _paste_into(self, ctrl, text, clear=True):
+            stats_before = kb_input.type_attempts
+            try:
+                ctrl.SetFocus()
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.1)
+            try:
+                if kb_input.type_into(ctrl, text, delay):
+                    return
+            except Exception as e:  # noqa: BLE001
+                print(f"  [输入] Unicode 注入异常，回退剪贴板：{type(e).__name__}: {e}", flush=True)
+            if not allow_cb and kb_input.type_attempts != stats_before:
+                # 明确要求只用键盘注入：失败就让它失败，别偷偷用剪贴板
+                raise RuntimeError("Unicode 注入失败，且已禁止回退剪贴板")
+            return orig(self, ctrl, text, clear)
+
+        _paste_into._dsh_unicode = True
+        WeChatUIA._paste_into = _paste_into
+
+    def _patch_input_text():
+        orig = WeChatGUI.input_text
+        if getattr(orig, "_dsh_unicode", False):
+            return
+
+        def input_text(self, text, box=None, fast=False):
+            tried = False
+
+            def attempt(t):
+                nonlocal tried
+                box_ = box or self.get_input_box()
+                if not box_ or not self.focus_input(box_):
+                    return False
+                ctrl = self._get_uia()._chat_input() if self._get_uia() is not None else None
+                if ctrl is not None:
+                    stats_before = kb_input.type_attempts
+                    if kb_input.type_into(ctrl, t, delay):
+                        self._last_input_box = box_
+                        return True
+                    tried = tried or (kb_input.type_attempts != stats_before)
+                if not allow_cb:
+                    return False
+                self.set_clipboard(t)
+                self._input.key(_VK_A_CTRL[0], ctrl=True)
+                self._input.key(0x2E)              # Delete
+                self._input.key(_VK_V_CTRL[0], ctrl=True)
+                time.sleep(0.8)
+                if self._input_box_has_text(box_):
+                    self._last_input_box = box_
+                    return True
+                return False
+
+            if attempt(text):
+                return True
+            if tried and not allow_cb:
+                return False
+            return orig(self, text, box, fast)   # 让上游自己的重试/拼音兜底接手
+
+        input_text._dsh_unicode = True
+        WeChatGUI.input_text = input_text
+
+    _patch_paste_into()
+    _patch_input_text()
+    if allow_cb:
+        return f"Unicode 注入（不碰剪贴板）· 失败时才回退剪贴板 · 逐字 {delay * 1000:.0f}ms"
+    return f"Unicode 注入（不碰剪贴板，禁用剪贴板回退）· 逐字 {delay * 1000:.0f}ms"
+
+
+_VK_A_CTRL = (0x41,)
+_VK_V_CTRL = (0x56,)
 
 
 # --------------------------------------------------------------------------
@@ -980,6 +1089,12 @@ def main():
     cfg = load_config(args.config)
     os.environ["WECHATAUTO_RHYTHM"] = str(cfg.get("rhythm", "fast"))
 
+    # 打补丁：发送时优先 Unicode 注入，绕开剪贴板（用户开了剪贴板同步）
+    input_mode = "(未启用)"
+    try:
+        input_mode = install_input_patch(input_cfg(cfg))
+    except Exception as e:  # noqa: BLE001
+        input_mode = f"补丁失败（{type(e).__name__}: {e}）→ 仍走剪贴板"
 
     if not acquire_single_instance_lock():
         print("[已在运行] 机器人已经启动过了，不要再开一个——两个进程会抢微信的")
@@ -1052,6 +1167,7 @@ def main():
               f"话题相关时再用一次轻量判定（回看 {cfg['trigger'].get('context_lookback', 8)} 条）")
     print(uns.describe())
     print(f"模式：{'DRY-RUN（不发送）' if args.dry_run else '正式（会真的发送）'}")
+    print(f"输入方式：{input_mode}")
     print(f"回复日志 → {REPLY_LOG}\n", flush=True)
 
     lst = Listener(db, interval=1.0)

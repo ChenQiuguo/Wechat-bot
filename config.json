@@ -56,6 +56,11 @@
     "tmessage"
   ],
   "skip_chat_names": ["微信团队", "文件传输助手", "订阅号", "服务通知"],
+  "input": {
+    "method": "unicode",
+    "char_delay": 0.012,
+    "fallback_clipboard": false
+  },
   "unsolicited": {
     "enabled": false,
     "max_age_seconds": 180,
