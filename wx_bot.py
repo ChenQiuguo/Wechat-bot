@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import urllib.request
+from collections import Counter
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -642,6 +643,42 @@ _VK_A_CTRL = (0x41,)
 _VK_V_CTRL = (0x56,)
 
 
+def _account_identity(db) -> tuple:
+    """返回 (wxid, 昵称, self_id)。self_id 由 filehelper 反推，多出来的 id 说明判定可疑。"""
+    try:
+        info = db.get_self_info() or {}
+    except Exception:  # noqa: BLE001
+        info = {}
+    wxid = info.get("username") or ""
+    nick = info.get("nick_name") or ""
+    try:
+        msgs = db.get_messages("filehelper", limit=200) or []
+        ids = [m.get("sender_id") for m in msgs if m.get("sender_id") is not None]
+        self_id = Counter(ids).most_common(1)[0][0] if ids else None
+        other_ids = len(set(ids)) - 1 if ids else 0
+    except Exception as e:  # noqa: BLE001
+        # 吞异常会让「自身判定」假装正常，必须报出来
+        print(f"  [警告] 推导自身 sender_id 失败：{type(e).__name__}: {e}", flush=True)
+        self_id, other_ids = None, 0
+    return wxid, nick, self_id, other_ids
+
+
+def account_guard(db, lock_wxid: str) -> str:
+    """每次心跳检查：还在操作启动时那个号吗？
+
+    多账号时上游库按「数据库最近改动」挑账号，换号后可能读到另一个号的库，
+    而 sender_id 是按账号编号的——**会把新号的自己发的消息当成别人发的，于是回复自己**。
+    返回 "ok" / "switched" / "unknown"。
+    """
+    try:
+        cur = (db.get_self_info() or {}).get("username") or ""
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    if not cur:
+        return "unknown"
+    return "ok" if cur == lock_wxid else "switched"
+
+
 # --------------------------------------------------------------------------
 # 回复策略
 # --------------------------------------------------------------------------
@@ -1138,6 +1175,7 @@ def main():
     db = WeChatDB()
     resolver = SenderResolver(db)
     info = db.get_self_info()
+    lock_wxid, lock_nick, lock_self_id, extra_ids = _account_identity(db)
 
     api_key = load_api_key()
     if not api_key:
@@ -1192,6 +1230,19 @@ def main():
         return 0
 
     print(f"账号：{info.get('nick_name')} ({info.get('username')})")
+    print(f"自身 sender_id：{lock_self_id}"
+          f"{'（⚠ filehelper 里出现多个 id，自身判定可能不准）' if extra_ids else ''}")
+    if extra_ids:
+        print("  ⚠ 建议退出重登微信、或跑 check_account.py 复核，否则可能回复自己")
+    try:                                    # 多账号时把另一个号也报出来，便于确认没挑错
+        from wechatauto.db import list_accounts
+        acts = list_accounts() or []
+        others = [a.get("wxid") for a in acts if a.get("wxid") and a.get("wxid") != lock_wxid]
+        if others:
+            print(f"⚠ 本机还有其它微信账号：{'、'.join(others)}")
+            print("  机器人只操作上面这个账号；换号后必须重启机器人（配置不热加载，账号也不重选）")
+    except Exception:  # noqa: BLE001
+        pass
     print(f"策略：私聊={cfg['trigger']['private']} 群@={cfg['trigger']['group_at']} "
           f"@{policy.at_names} 冷却={cfg['limits']['per_chat_cooldown']}s 节奏={cfg.get('rhythm')}")
     if cfg["trigger"].get("context_judge"):
@@ -1297,9 +1348,22 @@ def main():
     lst.add_all(on_msg, discover=True)
     lst.start()
     print("机器人运行中（Ctrl+C 停止）...", flush=True)
+    last_check = time.time()
     try:
         while True:
             time.sleep(1)
+            # 换号守卫：多账号时上游可能读到另一个号的库，self_id 会错位 → 会回复自己。
+            # 一旦发现账号变了，立刻停手，宁可不出声也不误发。
+            if time.time() - last_check >= 60:
+                last_check = time.time()
+                state = account_guard(db, lock_wxid)
+                if state == "switched":
+                    log_line(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ⚠ 检测到微信登录账号已变化"
+                             f"（启动时 {lock_nick}/{lock_wxid}）→ 立刻停止，避免认错人、回复自己")
+                    print("\n[!] 登录账号变了，机器人已退出。请重新双击 restart_bot.bat 启动。")
+                    break
+                if state == "unknown":
+                    print("  · 账号状态读不到（微信可能已退出登录），继续观察", flush=True)
     except KeyboardInterrupt:
         pass
     finally:

@@ -21,12 +21,18 @@
 |---|---|
 | 私聊自动回复 | AI 生成，带聊天上下文 |
 | 群聊 @ 自动回复 | 自动识别 `@本账号昵称` |
+| **提到名字也回** | 没被 @、但正文里叫了本账号的名字，或接着上文问关于他的事，也会接话（靠一次轻量判定，拿不准就答否） |
+| **主动接问题** | 群里没人点他，但有人问了个他确实答得上来的具体问题，会主动接一句；答不上来或只是闲聊就不插话（默认关闭） |
+| **一句一条** | 回复按句子自动拆开、一句一条发出去，像真人打字；可切回「整段一条」 |
+| **不碰剪贴板** | 发送走 `SendInput` Unicode 逐字注入，**不写系统剪贴板**（对开了剪贴板多端同步的人很重要） |
 | **思考模式** | 回复前先推理（思维链），回答更有条理；可用 `reasoning_effort` 调强度 |
 | **联系人记忆** | 每个会话一份小档案（关系/城市/爱好/近况/约定），回复时注入、事后异步更新 |
 | **带上下文的回复** | 每次把该会话最近 20 条消息一起给模型，能接住玩笑和梗 |
 | **会话列表点击发送** | 实测比库默认的搜索框路径**快一倍**（5.3s → 2.7s） |
+| **不点输入框** | 打开会话后焦点已在输入框，省掉那次点击（实测 **17.4s → 1.2s**，因为探测输入框要走截屏/OCR） |
 | 冷却与限流 | 每会话冷却、每分钟/每天上限，防刷屏防风控 |
 | 防重复启动 | 单实例锁，陈旧锁自动回收 |
+| **账号守卫** | 多账号时上游按「库最后改动」挑账号；本程序启动即锁定账号，运行中一旦发现换号**立刻停手**，避免把「自己发的消息」当成别人发的而回复自己 |
 | 回复风格可配置 | 默认正常口语（正经问题正经答，贫嘴时才偶尔皮一下），随便改 prompt |
 | 安全边界 | 不许替你答应借钱/邀约、不许编造行程与权限、不参与敏感话题、不泄露身份 |
 
@@ -54,13 +60,31 @@ pip install -r requirements.txt
     "model": "deepseek-flash",
     "thinking": true,
     "reasoning_effort": "high",
-    "history_limit": 8,
-    "system_prompt": "..."
+    "history_limit": 20,
+    "max_tokens": 800,
+    "max_chars": 220,
+    "system_prompt": "...",
+    "multi_send": {
+      "enabled": true,
+      "mode": "sentence",
+      "max_chars_per_message": 60,
+      "max_messages": 4,
+      "separator": "|||"
+    }
+  },
+  "input": {
+    "method": "unicode",
+    "char_delay": 0.012,
+    "fallback_clipboard": false,
+    "click_input": false
   },
   "trigger": {
     "private": true,
     "group_at": true,
     "at_names": [],
+    "name_hits": [],
+    "context_judge": true,
+    "context_lookback": 8,
     "types": ["文本"],
     "max_age_seconds": 120
   },
@@ -69,11 +93,26 @@ pip install -r requirements.txt
     "max_replies_per_minute": 20,
     "max_replies_per_day": 300
   },
+  "unsolicited": {
+    "enabled": false,
+    "per_chat_cooldown": 480,
+    "max_per_minute": 2,
+    "max_per_day": 10
+  },
   "rhythm": "fast"
 }
 ```
 
-`at_names` 留空即可——运行时会**自动把本账号昵称加进去**，不用写死。
+`at_names` / `name_hits` 留空即可——运行时会**自动把本账号昵称加进去**，不用写死。
+
+几个容易搞混的开关：
+
+| 开关 | 作用 |
+|---|---|
+| `ai.multi_send.mode` | `sentence`＝一句一条（默认）；`separator`＝只在模型写 `\|\|\|` 处切；`enabled:false`＝整段一条 |
+| `input.method` | `unicode`＝只用键盘注入（默认）；`auto`＝注入失败可回退剪贴板；`clipboard`＝不打补丁 |
+| `trigger.context_judge` | 没人点你时，是否花一次轻量判定决定「要不要接话」 |
+| `unsolicited.enabled` | 群里有人问了能答的问题时是否**主动**接一句（默认关，开了也只在群聊、私聊永不主动） |
 
 **API Key** 按顺序从这些位置找（都不会被写进仓库）：
 
@@ -97,11 +136,19 @@ Windows 上双击 `start_bot.bat` 即可（会自动找 Python、检查微信是
 ```bat
 python doctor.py                        :: 自检：密钥提取/解密/会话/消息读取
 python tools/probe_self_id.py           :: 推导本机「自己」的 sender_id
+python tools/check_account.py --chats   :: 账号自检：当前连的是哪个号、自身判定有没有错位
+python tools/export_history.py --list   :: 列出有消息的会话（导出留档用）
+python tools/export_history.py --who 某人 :: 导出某会话全部聊天记录（Markdown/JSONL/txt）
 python tools/verify_payload.py          :: 用真实历史消息验证发送者解析与正文清洗
 python tools/preview_replies.py         :: 预览一批典型/刁钻消息的 AI 回复
 python tools/measure_tokens.py          :: 实测单次回复的 token 消耗与成本
 python tools/bench_send.py 3            :: 对比两种发送路径的耗时
+python tools/probe_send_filehelper.py   :: 端到端发送自测（默认只输入不发送；只发文件传输助手）
+python tools/probe_focus_after_open.py  :: 实测打开会话后焦点是否已在输入框
 ```
+
+> ⚠️ 自测请一律用**文件传输助手**（`filehelper`，它在 `skip_chats` 里，机器人不会回复它），
+> 不要拿真人群当靶子。
 
 ---
 
@@ -251,6 +298,69 @@ prompt 里写死了这些规则，实测有效：
 * **失败无副作用**：抽取或保存失败就保留旧档案，主流程不受影响。
 
 > ⚠️ `memory/` 已写进 `.gitignore`——档案含聊天内容，**绝对不要提交**。
+
+---
+
+### 11. 发送别用剪贴板：`SendInput` + `KEYEVENTF_UNICODE`
+
+上游发送消息**两条路都写系统剪贴板**再 `Ctrl+V`：UIA 快路径 `_paste_into`（`_clip_set` + `Ctrl+V`）、
+OCR 回退路径 `input_text`（`set_clipboard` + `Ctrl+V`）。如果开了剪贴板多端同步，
+**每发一条回复，内容就同步到手机/其它电脑一次**。
+
+库里其实有个 `ValuePattern.SetValue` 的写法（`_set_text`）不碰剪贴板，但它注释里写明
+**不能用于聊天输入框**：SetValue 不让 Qt 控件获得焦点，而发送靠回车落到那个焦点上。
+
+**解决**：`kb_input.py` 用 `SendInput` + `KEYEVENTF_UNICODE` 逐字注入，
+中英文/标点/代理对 emoji 都进得去；打完**回读输入框校验内容一致**，
+不一致就清空并交回剪贴板路径（绝不带着写了一半的输入框按回车）。
+实测发送前后剪贴板内容一字未变。
+
+### 12. 打开会话后**不用**再点输入框（实测 17.4s → 1.2s）
+
+`WeChatGUI.get_input_box()` 是**截屏 + OCR** 探测，不是 UIA。实测：
+
+| 做法 | 结果 | 耗时 |
+|---|---|---|
+| 仅 `open_chat` 后直接注入 | ✅ 落进输入框 | **1.22s** |
+| 先点会话列表那一行 | ❌ 找不到输入框控件 | — |
+| 点一下输入框再注入 | ✅ 落进输入框 | **17.42s** |
+
+连发（两个群来回切 3 轮共 6 次）全部落进输入框。所以补丁默认不点输入框，
+只有注入失败时才用 UIA 重开会话把焦点交回去（**不触发 OCR**）。
+
+### 13. 多账号：`sender_id` 按账号编号，换号会「回复自己」
+
+`sender_id`（`real_sender_id`）是**按登录账号编号**的。机器人启动时从 `filehelper` 反推出
+「自己是 id N」；换号后新号的自身 id 变了，**新号自己发的消息会被当成别人发的 → 机器人回复自己**。
+
+更坑的是上游挑账号的方式：`_pick_account()` 取「数据库最后被改动」的账号，不是「当前登录」的
+——两个号的库改动时间可能只差一两分钟。
+
+**解决**：`wx_bot.py` 启动时锁定账号（打印昵称/wxid/自身 sender_id，并列出本机其它账号），
+主循环每 60 秒核对一次登录账号，**一旦变了立刻停止**并写日志，宁可不出声也不误发。
+自检工具：`python tools/check_account.py --chats`。
+
+### 14. 导出聊天记录时，说话人判定别信 `sender_id == 2`
+
+同一台机器上不同账号的 `sender_id` 含义不同，所以**按账号编号硬编码「2 就是自己」必然出错**。
+`export_history.py` 用的是三条按可靠性排序的依据：
+
+1. `filehelper`（必然全是自己发的）反推「我的 id」；
+2. 私聊里的「一聊抵消」：出现的 id 只有两个，不是我的那个就是对方；
+3. 消息 XML 里的 `fromusername`（**真实发送者**，不受换号影响）做交叉校验，
+   矛盾就报警，而不是静默输出。
+
+导出普通会话实测：`sender_id → 人` 映射唯一、交叉校验零矛盾、无未判定消息。
+
+### 15. 上游节奏层会「莫名其妙等几十秒」，先看档位
+
+`rhythm` 的档位**落盘在 `~/.wechatauto/rhythm.json`、跨进程生效**。不设
+`WECHATAUTO_RHYTHM` 时用默认 `natural` 档：写动作间隔 2.5–6s、**120 秒内只允许 6 次写动作**、
+撞上限冷却 30–75s。实测因此出现过「第二条消息等了 41.95s」「`gate('send')` 等了 73.16s」
+——那是防风控层，不是代码慢。
+
+同一次连发实测：`fast` 档（写动作间隔 0.6–1.4s、120s 内 20 次）第 1 条 1.55s、第 2 条 1.67s；
+`natural` 档第 2 条 43.34s（其中 41.95s 是纯等待）。**跑实测脚本前记得设档位。**
 
 ## 致谢
 
