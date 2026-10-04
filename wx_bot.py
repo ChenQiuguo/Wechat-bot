@@ -165,12 +165,65 @@ def build_history(db: WeChatDB, resolver: "SenderResolver", chat_username: str,
     return lines[-limit:]
 
 
-def ai_reply(cfg: dict, content: str, sender: str, chat_name: str, is_group: bool,
-             history=None, me_name: str = "", mem_block: str = "") -> str:
-    key = load_api_key()
+def _chat_call(cfg: dict, system_prompt: str, user_prompt: str, *, thinking: bool,
+               max_tokens: int, timeout: float, temperature: float = 1.2,
+               reasoning_effort: str = "high", api_key: str = "") -> str:
+    """调一次 chat/completions，返回正文（失败返回空串）。"""
+    key = api_key or load_api_key()
     if not key:
         return ""
+    body = {
+        "model": cfg["model"],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    if thinking:
+        # 思考模式：先出思维链再出答案；注意该模式下 temperature 会被忽略
+        body["thinking"] = {"type": "enabled"}
+        body["reasoning_effort"] = reasoning_effort
+    else:
+        # 必须显式 disabled：deepseek-flash 不传 thinking 时默认自己开思考，
+        # 思维链会把 max_tokens 吃光、content 返回空串（二选一的判定会静默全错）。
+        body["thinking"] = {"type": "disabled"}
+        body["temperature"] = temperature
+    req = urllib.request.Request(
+        cfg["base_url"].rstrip("/") + "/chat/completions",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        print(f"[AI 失败] {type(e).__name__}: {e}", flush=True)
+        return ""
+    msg = (data.get("choices") or [{}])[0].get("message") or {}
+    out = (msg.get("content") or "").strip()
+    if not out:
+        reasoning = str(msg.get("reasoning_content") or "")
+        if reasoning:
+            print(f"[AI 空回复] 思维链吃掉了 max_tokens（{reasoning[:40]!r}…），"
+                  f"需要显式 thinking=disabled 或调大 max_tokens", flush=True)
+    return out
 
+
+def _with_key(ai_cfg: dict, api_key: str) -> dict:
+    """把 api_key 塞进 cfg，供 ai_reply 透传给 _chat_call（避免每步重读凭据文件）。"""
+    c = dict(ai_cfg)
+    if api_key:
+        c["_api_key"] = api_key
+    return c
+
+
+def ai_reply(cfg: dict, content: str, sender: str, chat_name: str, is_group: bool,
+             history=None, me_name: str = "", mem_block: str = "",
+             api_key: str = "") -> str:
+    api_key = api_key or cfg.get("_api_key", "")
     who = f"{sender}（在群「{chat_name}」里）" if is_group else sender
 
     ident = ""
@@ -188,42 +241,23 @@ def ai_reply(cfg: dict, content: str, sender: str, chat_name: str, is_group: boo
     parts.append(f"{who} 刚发来：{content}")
     user_prompt = "".join(parts)
 
-    body = {
-        "model": cfg["model"],
-        "messages": [
-            {"role": "system", "content": cfg["system_prompt"]},
-            {"role": "user", "content": user_prompt},
-        ],
-        "max_tokens": cfg.get("max_tokens", 400),
-        "stream": False,
-    }
-    if cfg.get("thinking", False):
-        # 思考模式：先出思维链再出答案；注意该模式下 temperature 会被忽略
-        body["thinking"] = {"type": "enabled"}
-        body["reasoning_effort"] = cfg.get("reasoning_effort", "high")
-    else:
-        body["temperature"] = cfg.get("temperature", 1.2)
-    req = urllib.request.Request(
-        cfg["base_url"].rstrip("/") + "/chat/completions",
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=cfg.get("timeout", 20)) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        text = data["choices"][0]["message"]["content"].strip()
-        text = text.strip("「」\"'“”").strip()
-        # 句末不加句号（模型偶尔仍会加，这里兜底剥掉；问号/感叹号/省略号保留）
-        text = text.rstrip("。.").rstrip()
-        # 长度上限可配置：默认 220 字，够展开讲清楚，又不至于刷屏
-        limit = int(cfg.get("max_chars", 220) or 0)
-        if limit > 0:
-            text = text[:limit].rstrip()
-        return text
-    except Exception as e:  # noqa: BLE001
-        print(f"[AI 失败] {type(e).__name__}: {e}", flush=True)
+    text = _chat_call(cfg, cfg["system_prompt"], user_prompt,
+                      thinking=bool(cfg.get("thinking", False)),
+                      max_tokens=cfg.get("max_tokens", 400),
+                      timeout=cfg.get("timeout", 20),
+                      temperature=cfg.get("temperature", 1.2),
+                      reasoning_effort=cfg.get("reasoning_effort", "high"),
+                      api_key=api_key)
+    if not text:
         return ""
+    text = text.strip("「」\"'“”").strip()
+    # 句末不加句号（模型偶尔仍会加，这里兜底剥掉；问号/感叹号/省略号保留）
+    text = text.rstrip("。.").rstrip()
+    # 长度上限可配置：默认 220 字，够展开讲清楚，又不至于刷屏
+    limit = int(cfg.get("max_chars", 220) or 0)
+    if limit > 0:
+        text = text[:limit].rstrip()
+    return text
 
 
 # --------------------------------------------------------------------------
@@ -283,39 +317,193 @@ def _judge_user_prompt(me_names, chat_name: str, sender: str, text: str, recent)
 def judge_targeted(cfg: dict, me_names, chat_name: str, sender: str,
                    text: str, recent, api_key: str = "") -> bool:
     """便宜的一次判定：这条消息该不该由我回应。失败一律返回 False（宁可不回）。"""
-    key = api_key or load_api_key()
-    if not key:
-        return False
     jc = cfg.get("judge") or {}
-    body = {
-        "model": jc.get("model") or cfg.get("model", "deepseek-flash"),
-        "messages": [
-            {"role": "system", "content": "你是一个严格的消息归类器，只输出「是」或「否」，不要任何解释。"},
-            {"role": "user", "content": _judge_user_prompt(me_names, chat_name, sender, text, recent)},
-        ],
-        "max_tokens": int(jc.get("max_tokens", 16)),
-        # 实测坑：deepseek-flash 默认开思考，思维链会把 max_tokens 吃光、
-        # content 返回空串，判定就永远失败。判定这种二选一必须显式关掉思考。
-        "thinking": {"type": "disabled"},
-        "stream": False,
-    }
-    req = urllib.request.Request(
-        cfg["base_url"].rstrip("/") + "/chat/completions",
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=jc.get("timeout", 12)) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        out = (data["choices"][0]["message"]["content"] or "").strip()
-        if not out:
-            print("  [相关判定] 返回为空，按「无关」处理（检查 judge.max_tokens / thinking）", flush=True)
-            return False
-        return out.startswith("是")
-    except Exception as e:  # noqa: BLE001
-        print(f"  [相关判定失败] {type(e).__name__}: {e}", flush=True)
+    out = _chat_call(cfg,
+                     "你是一个严格的消息归类器，只输出「是」或「否」，不要任何解释。",
+                     _judge_user_prompt(me_names, chat_name, sender, text, recent),
+                     # 实测坑：deepseek-flash 默认开思考，思维链会把 max_tokens 吃光、
+                     # content 返回空串，判定就永远失败。二选一必须显式关掉思考。
+                     thinking=False, max_tokens=int(jc.get("max_tokens", 16)),
+                     timeout=jc.get("timeout", 12), temperature=0)
+    if not out:
         return False
+    return out.startswith("是")
+
+
+# --------------------------------------------------------------------------
+# 没人点我，但群里有人问了个我能答的问题 → 主动接一句
+# --------------------------------------------------------------------------
+
+# 像「在问问题」的说法，命中才值得花一次判定
+_QUESTION_WORDS = (
+    "怎么", "怎样", "咋", "如何", "为什么", "为何", "哪个", "哪一个", "哪些", "是什么", "什么是",
+    "多少", "多久", "几天", "几点", "哪里", "哪儿", "能不能", "可不可以", "可以吗", "行不行",
+    "有没有", "是不是", "对不对", "值不值", "要不要", "会不会", "该不该", "求", "请问",
+    "谁知道", "有人知道", "谁知道", "求助", "问一下", "问下", "帮我看", "帮我看看", "教教我",
+)
+
+
+def looks_like_question(text: str) -> bool:
+    """粗筛：这条像不像在问问题（真正的判断交给模型，这里只挡掉闲聊）。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t.endswith(("?", "？")):
+        return True
+    return any(w in t for w in _QUESTION_WORDS)
+
+
+def _can_answer_prompt(me_names, chat_name: str, sender: str, text: str, recent) -> str:
+    names = "、".join(n for n in dict.fromkeys(me_names) if n)
+    lines = []
+    if recent:
+        lines.append("群里最近的记录（最后一条就是刚收到的这条）：")
+        lines.extend(recent)
+        lines.append("")
+    lines.append(f"刚收到：{sender}: {text}")
+    return (
+        f"你是「{names}」，在一个微信群里。上面这条消息**没有点你的名**，你在犹豫要不要主动接一句。\n\n"
+        + "\n".join(lines) + "\n\n"
+        "回答「是」只在这些情况下：\n"
+        "1. 对方在问一个**具体问题**（怎么办、为什么、哪个好、报错怎么修、有没有人知道…），"
+        "而你**确实有能落地的答案**，接一句有用；\n"
+        "2. 对方在求助/求证，群里还没人回答，你答得上；\n"
+        "3. 群成员名单/聊天记录里已经有答案线索，你能一句话讲清。\n\n"
+        "回答「否」的情况：\n"
+        "- 只是闲聊、吐槽、发表情、喊人、跟别人说话；\n"
+        "- 问题太宽泛或信息不够，答了只能瞎猜；\n"
+        "- 你答不上来，或只能说「不知道」「看情况」这类废话；\n"
+        "- **群里已经有人回答了这个问题**，而你没有更准确的补充；\n"
+        "- 涉及政治、宗教、时事、他人隐私等红线话题。\n\n"
+        "拿不准就答否——**插话插错了比不说话更糟**。只输出一个字：是 或 否。"
+    )
+
+
+def can_answer_question(cfg: dict, me_names, chat_name: str, sender: str,
+                        text: str, recent, api_key: str = "") -> bool:
+    """判定：这群里没人点我，但我该不该主动接下这个问题。失败返回 False。"""
+    jc = cfg.get("judge") or {}
+    out = _chat_call(cfg,
+                     "你是一个严格的判定器，只输出「是」或「否」，不要任何解释。",
+                     _can_answer_prompt(me_names, chat_name, sender, text, recent),
+                     thinking=False, max_tokens=int(jc.get("max_tokens", 16)),
+                     timeout=jc.get("timeout", 12), temperature=0)
+    if not out:
+        return False
+    return out.startswith("是")
+
+
+def unsolicited_fill(ai_cfg: dict, me_name: str, chat_name: str, sender: str,
+                     text: str, history, mem_block: str = "", api_key: str = "") -> str:
+    """没人点我，我主动接这个问题的回答（不发送）。"""
+    cfg = dict(ai_cfg)
+    cfg["system_prompt"] = (
+        ai_cfg["system_prompt"]
+        + "\n\n【这次没人点你的名，是你自己主动接话】\n"
+          "群里有人问了个你能答的问题，你主动接一句。要求：\n"
+          "1. 直给答案或办法，别客套、别说「我来回答一下」这种话，开口就是内容；\n"
+          "2. 别 @ 任何人，也别在开头写自己或别人的名字，直接说话；\n"
+          "3. 答不上来就别答（宁可不说）；\n"
+          "4. 上面所有安全红线照旧生效。"
+    )
+    ident = ""
+    if me_name:
+        ident = f"你的微信昵称是「{me_name}」，你就是本人，用第一人称说话。\n\n"
+    ctx = ""
+    if history:
+        ctx = "群里最近的记录（最后一条就是刚收到的）：\n" + "\n".join(history) + "\n\n"
+    parts = [ident]
+    if mem_block:
+        parts.append(mem_block.strip() + "\n\n")
+    parts.append(ctx)
+    parts.append(f"{sender} 在群里问：{text}")
+    return ai_reply(cfg, "".join(parts), sender, chat_name, True,
+                    history, me_name=me_name, mem_block=mem_block, api_key=api_key)
+
+
+# --------------------------------------------------------------------------
+# 「没人点我但值得接一句」的闸门
+# --------------------------------------------------------------------------
+
+class UnsolicitedPolicy:
+    """控制「主动接问题」的频率：只回问题、有冷却、有每日上限。
+
+    与 ReplyPolicy 独立，避免把「被 @ 必回」和「主动插话」两套节奏搅在一起。
+    """
+
+    def __init__(self, cfg: dict, db):
+        self.cfg = cfg
+        self.db = db
+        self.u = dict(cfg.get("unsolicited") or {})
+        self._last: dict = {}
+        self._recent: list = []
+        self._count_today = 0
+        self._day = time.strftime("%Y-%m-%d")
+        self._lock = threading.Lock()
+        self.asked = 0          # 真正跑了模型判定的次数（看成本用）
+        self.hits = 0
+        try:
+            self.me_name = (db.get_self_info() or {}).get("nick_name") or ""
+        except Exception:  # noqa: BLE001
+            self.me_name = ""
+
+    def _bump_day(self):
+        today = time.strftime("%Y-%m-%d")
+        if today != self._day:
+            self._day, self._count_today = today, 0
+
+    def check(self, payload: dict, recent, api_key: str = "") -> tuple:
+        """返回 (是否主动接一句, 原因)。"""
+        if not self.u.get("enabled", False):
+            return False, "主动接话未开启"
+        if not payload.get("is_group"):
+            return False, "私聊不主动"        # 用户明确要求：私聊永不主动
+        if payload.get("is_self"):
+            return False, "自己发的"
+        text = (payload.get("content") or "").strip()
+        if not text:
+            return False, "空消息"
+        ts = float(payload.get("timestamp") or 0)
+        if ts and time.time() - ts > float(self.u.get("max_age_seconds", 180)):
+            return False, "消息过旧"
+        if not looks_like_question(text):
+            return False, "不是在问问题"
+
+        now = time.time()
+        with self._lock:
+            self._bump_day()
+            if self._count_today >= int(self.u.get("max_per_day", 10)):
+                return False, "触发每日主动接话上限"
+            per_chat = float(self.u.get("per_chat_cooldown", 480))
+            last = self._last.get(payload["chat_username"], 0)
+            if now - last < per_chat:
+                return False, f"这个群刚接过话({int(per_chat - (now - last))}s)"
+            self._recent = [t for t in self._recent if now - t < 60]
+            if len(self._recent) >= int(self.u.get("max_per_minute", 2)):
+                return False, "触发每分钟主动接话上限"
+
+        self.asked += 1
+        if not can_answer_question(self.cfg["ai"], self._names(), payload["chat_name"],
+                                   payload["sender"], text, recent or [], api_key):
+            return False, "判定为不该插话"
+        self.hits += 1
+        return True, "ok"
+
+    def _names(self) -> list:
+        return [self.me_name] if self.me_name else []
+
+    def mark(self, chat_username: str):
+        now = time.time()
+        with self._lock:
+            self._bump_day()
+            self._last[chat_username] = now
+            self._recent.append(now)
+            self._count_today += 1
+
+    def describe(self) -> str:
+        return (f"主动接问题：{'开' if self.u.get('enabled') else '关'} "
+                f"（群里有人问了能答的问题就接；同群间隔 ≥{int(self.u.get('per_chat_cooldown', 480)) // 60} 分钟，"
+                f"每天 ≤{self.u.get('max_per_day', 10)} 次，私聊不主动）")
 
 
 # --------------------------------------------------------------------------
@@ -584,190 +772,6 @@ def parse_multi(raw, separator: str = "|||", max_parts: int = 0) -> list:
         parts = head
     return parts
 
-
-def build_proactive_cfg(cfg: dict) -> dict:
-    """主动开话题的配置 + 专用提示词覆盖（安全红线原样保留）。"""
-    p = dict(cfg.get("proactive") or {})
-    if not (p.get("prompt") or "").strip():
-        p["prompt"] = (
-            cfg["ai"]["system_prompt"]
-            + "\n\n【这次不是回复，是主动开个话头】\n"
-              "群里已经安静了一会儿，你想主动说句话把话头接起来。要求：\n"
-              "1. 接上最近的话题，或说一件你这边的新鲜事/一个具体的问题，别空喊「有人在吗」；\n"
-              "2. 一两句就够，别长篇大论，别说教；\n"
-              "3. 别重复最近自己说过的话，也别把上面聊过的内容复述一遍；\n"
-              "4. 上面所有安全红线照旧生效。"
-        )
-    return p
-
-
-def proactive_reply(cfg: dict, db, resolver, chat_username: str, chat_name: str,
-                    me_name: str = "", mem_block: str = "", recent_said=None) -> str:
-    """生成一条主动消息（不发送）。"""
-    ai = dict(cfg["ai"])
-    history = build_history(db, resolver, chat_username, int(ai.get("history_limit", 8)))
-    p = build_proactive_cfg(cfg)
-    ai["system_prompt"] = p["prompt"]
-    if recent_said:
-        mem_block = (mem_block or "") + "\n\n【你最近主动说过的话，别重复】" + " / ".join(recent_said[-3:])
-    who = f"群「{chat_name}」现在没人说话"
-    return ai_reply(ai, "（现在没人发消息，你主动起个话头）", who, chat_name, True,
-                    history, me_name=me_name, mem_block=mem_block)
-
-
-def in_quiet_hours(cfg: dict, now=None) -> bool:
-    """现在是否处于免打扰时段（跨零点也支持）。"""
-    span = (cfg.get("proactive") or {}).get("quiet_hours") or []
-    if len(span) != 2:
-        return False
-    t = time.localtime(now or time.time())
-    hm = t.tm_hour * 60 + t.tm_min
-    a, b = int(span[0]) * 60, int(span[1]) * 60
-    return (a <= hm < b) if a <= b else (hm >= a or hm < b)
-
-
-def _chat_idle_seconds(db, chat_username: str) -> float:
-    """该会话最后一条消息距今多少秒（读不到就返回 0，即不主动）。"""
-    try:
-        msgs = db.get_messages(chat_username, limit=1) or []
-        if not msgs:
-            return 0.0
-        ts = float(msgs[0].get("create_time") or 0)
-        return max(0.0, time.time() - ts) if ts else 0.0
-    except Exception:  # noqa: BLE001
-        return 0.0
-
-
-class ProactiveScheduler:
-    """空闲很久时主动找个话头。只对显式列进 proactive.chats 的群生效。"""
-
-    def __init__(self, cfg: dict, db, resolver, policy, send_multi, get_gui=None):
-        self.cfg = cfg
-        self.db = db
-        self.resolver = resolver
-        self.policy = policy
-        self.send_multi = send_multi
-        self.p = dict(cfg.get("proactive") or {})
-        self.chats = [c for c in (self.p.get("chats") or []) if isinstance(c, str) and c.strip()]
-        self._day = time.strftime("%Y-%m-%d")
-        self._count_today = 0
-        self._last_proactive: dict = {}
-        self._recent_said: dict = {}
-        self._lock = threading.Lock()
-        try:
-            self.me_name = (db.get_self_info() or {}).get("nick_name") or ""
-        except Exception:  # noqa: BLE001
-            self.me_name = ""
-
-    # ---- 闸门 ----
-    def _bump_day(self):
-        today = time.strftime("%Y-%m-%d")
-        if today != self._day:
-            self._day, self._count_today = today, 0
-
-    def why_not(self, chat_username: str, now: float = None) -> str:
-        """判断这个会话现在能不能主动说话，不能则返回原因。"""
-        now = now or time.time()
-        if not self.p.get("enabled", False):
-            return "主动开话题未开启"
-        if not self.chats:
-            return "没配置 proactive.chats（不知道去哪个群说话）"
-        if in_quiet_hours(self.cfg, now):
-            return "免打扰时段"
-        with self._lock:
-            self._bump_day()
-            if self._count_today >= self.p.get("max_per_day", 6):
-                return "触发每日主动上限"
-            if now - self._last_proactive.get(chat_username, 0) < self.p.get("min_gap_per_chat", 3600):
-                return "这个群刚主动过"
-        idle = _chat_idle_seconds(self.db, chat_username)
-        if idle < self.p.get("min_idle_minutes", 40) * 60:
-            return f"群里刚说过话（空闲 {int(idle / 60)} 分钟）"
-        return "ok"
-
-    def note_activity(self, chat_username: str):
-        """有人说话了 → 这个群重新计时，别再去开话头。"""
-        with self._lock:
-            self._last_proactive[chat_username] = 0.0
-
-    def _touch(self, chat_username: str):
-        """记一次尝试（哪怕没发出去）——否则调度循环会每 60 秒重试同一个群。"""
-        with self._lock:
-            self._last_proactive[chat_username] = time.time()
-
-    def _mark(self, chat_username: str, said: str):
-        with self._lock:
-            self._bump_day()
-            self._count_today += 1
-            self._last_proactive[chat_username] = time.time()
-            self._recent_said.setdefault(chat_username, []).append(said)
-            self._recent_said[chat_username] = self._recent_said[chat_username][-5:]
-
-    # ---- 主循环 ----
-    def run_once(self, chat_username: str = "", force: bool = False, dry_run: bool = False) -> bool:
-        """挑一个群说一句话。force=True 时跳过空闲/间隔判断（手动测试用）。"""
-        if chat_username:
-            if not force:
-                why = self.why_not(chat_username)
-                if why != "ok":
-                    print(f"  · 不主动：{why}", flush=True)
-                    return False
-            targets = [chat_username]
-        else:
-            targets = [c for c in self.chats if force or self.why_not(c) == "ok"]
-            if targets:
-                # 最冷清的先来
-                targets.sort(key=lambda c: -_chat_idle_seconds(self.db, c))
-        if not targets:
-            return False
-        for cu in targets:
-            try:
-                chat_name = self.db.get_nickname(cu) or cu
-            except Exception:  # noqa: BLE001
-                chat_name = cu
-            mem_block = ""
-            if self.cfg["ai"].get("memory", {}).get("enabled", True):
-                try:
-                    mem_block = memory_store.prompt_block(memory_store.load(cu))
-                except Exception:  # noqa: BLE001
-                    mem_block = ""
-            self._touch(cu)          # 先记账，失败也不至于 60 秒后又来一次
-            try:
-                raw = proactive_reply(self.cfg, self.db, self.resolver, cu, chat_name,
-                                      self.me_name, mem_block,
-                                      self._recent_said.get(cu))
-            except Exception as e:  # noqa: BLE001
-                print(f"  [主动生成失败] {type(e).__name__}: {e}", flush=True)
-                continue
-            texts = parse_multi(raw, (self.p.get("separator") or ""),
-                                int(self.p.get("max_messages", 2)))
-            if not texts:
-                print("  · 主动生成结果为空，跳过", flush=True)
-                continue
-            idle_min = int(_chat_idle_seconds(self.db, cu) / 60)
-            log_line(f"[主动开话题] {chat_name}（空闲 {idle_min} 分钟）: {' ｜ '.join(texts)}")
-            if dry_run:
-                return True
-            ok, _n = self.send_multi(texts, cu, chat_name)
-            if ok:
-                self._mark(cu, texts[0])
-                try:
-                    self.policy.mark(cu)
-                except Exception:  # noqa: BLE001
-                    pass
-                return True
-        return False
-
-    def loop(self, stop_event: threading.Event, dry_run: bool = False):
-        interval = float(self.p.get("check_interval", 60))
-        while not stop_event.wait(interval):
-            try:
-                # 一轮最多主动一次，别连环轰炸
-                self.run_once(dry_run=dry_run)
-            except Exception as e:  # noqa: BLE001
-                print(f"  [主动调度异常] {type(e).__name__}: {e}", flush=True)
-
-
 def _resp_ok(resp) -> bool:
     ok = bool(getattr(resp, "is_success", None))
     if not ok and isinstance(resp, dict):
@@ -826,18 +830,70 @@ def do_send_impl(args, get_gui, send_lock, db, text, chat_username, chat_name):
 
 
 def main():
+    # ---- 只读诊断模式：必须在拿单实例锁之前处理，机器人跑着也能用 ----
+    # （--can-answer "<群里的话>" --chat 群名 → 看这句话会不会被主动接）
+    if "--can-answer" in sys.argv:
+        qp = argparse.ArgumentParser(description="试一下群里这句话会不会被主动接")
+        qp.add_argument("--config", default=CONFIG_PATH)
+        qp.add_argument("--can-answer", required=True)
+        qp.add_argument("--chat", default="", help="群名或群 wxid")
+        qp.add_argument("--can-answer-send", action="store_true", help="真的发出去")
+        qa, _unknown = qp.parse_known_args()
+        qcfg = load_config(qa.config)
+        db0 = WeChatDB()
+        res0 = SenderResolver(db0)
+        qkey = load_api_key()
+        me0 = (db0.get_self_info() or {}).get("nick_name") or ""
+        cu = (qa.chat or "").strip()
+        if cu and not _looks_like_wxid(cu):
+            try:
+                cu = db0.group_name_to_id(cu) or db0.username_by_nickname(cu) or cu
+            except Exception:  # noqa: BLE001
+                cu = qa.chat.strip()
+        if not cu:
+            print("[错误] --can-answer 需要配 --chat 群名（或群 wxid）")
+            return 1
+        chat_name = db0.get_nickname(cu) or cu
+        hist = build_history(db0, res0, cu, int(qcfg["ai"].get("history_limit", 8)))
+        print(f"群「{chat_name}」收到：{qa.can_answer}")
+        print(f"  粗筛像是问题：{looks_like_question(qa.can_answer)}")
+        if qa.can_answer_send:
+            print("  ⚠ --can-answer-send 已开，判定为「接」时会真的发到群里")
+        if looks_like_question(qa.can_answer):
+            qai = _with_key(qcfg["ai"], qkey)
+            hit = can_answer_question(qai, [me0], chat_name, "群友", qa.can_answer, hist,
+                                      api_key=qkey)
+            print(f"  判定该主动接：{hit}")
+            if hit:
+                reply = unsolicited_fill(qai, me0, chat_name, "群友", qa.can_answer, hist,
+                                         api_key=qkey)
+                ms = dict(qcfg["ai"].get("multi_send") or {})
+                sep = ms.get("separator", "|||") if ms.get("enabled", True) else ""
+                texts = parse_multi(reply, sep, int(ms.get("max_messages", 3)))
+                print(f"  生成 {len(texts)} 条：")
+                for i, t in enumerate(texts, 1):
+                    print(f"     ({i}) {t}")
+                if qa.can_answer_send:
+                    box = {"gui": None}
+
+                    def _gui():
+                        if box["gui"] is None:
+                            from wechatauto.guia import WeChatGUI
+                            box["gui"] = WeChatGUI()
+                        return box["gui"]
+
+                    send_multi_impl(_gui, threading.Lock(), db0, texts, cu, chat_name)
+        return 0
+
     ap = argparse.ArgumentParser(description="微信 AI 自动回复机器人")
     ap.add_argument("--config", default=CONFIG_PATH)
     ap.add_argument("--dry-run", action="store_true", help="只生成回复，不发送")
     ap.add_argument("--test-reply", default="", help="测试：把该文本当私信走完整流程（发到文件传输助手）")
-    ap.add_argument("--proactive-now", default=None, nargs="?", const="",
-                    help="立刻试一条主动消息（可跟群名；默认只生成不发送）")
-    ap.add_argument("--proactive-send", action="store_true",
-                    help="配合 --proactive-now：真的发出去")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     os.environ["WECHATAUTO_RHYTHM"] = str(cfg.get("rhythm", "fast"))
+
 
     if not acquire_single_instance_lock():
         print("[已在运行] 机器人已经启动过了，不要再开一个——两个进程会抢微信的")
@@ -858,6 +914,8 @@ def main():
 
     policy = ReplyPolicy(cfg, resolver, db)
     policy.api_key = api_key
+    uns = UnsolicitedPolicy(cfg, db)
+    uns.api_key = api_key
 
     # 发送端：只初始化一次，避免每次发送都重新校准布局
     sender = {"gui": None}
@@ -884,27 +942,6 @@ def main():
             return True, len(texts)
         return send_multi_impl(get_gui, send_lock, db, texts, chat_username, chat_name)
 
-    sched = ProactiveScheduler(cfg, db, resolver, policy, send_multi)
-
-    # --proactive-now [群名]：立刻试一条主动消息（默认只生成不发送）
-    if args.proactive_now is not None:
-        who = (args.proactive_now or "").strip()
-        cu = who
-        if who and not _looks_like_wxid(who):
-            try:
-                cu = db.username_by_nickname(who) or db.group_name_to_id(who) or who
-            except Exception:  # noqa: BLE001
-                cu = who
-        if not cu:
-            cu = (sched.chats or [""])[0]
-        if not cu:
-            print("[错误] 没指定群，且 config 里 proactive.chats 是空的")
-            return 1
-        chat_name = db.get_nickname(cu) or cu
-        print(f"主动开话题试跑 → {chat_name}（空闲 {int(_chat_idle_seconds(db, cu) / 60)} 分钟）")
-        sched.run_once(cu, force=True, dry_run=not args.proactive_send)
-        return 0
-
     # --test-reply：模拟一条私信
     if args.test_reply:
         fake = {
@@ -927,61 +964,85 @@ def main():
     if cfg["trigger"].get("context_judge"):
         print(f"群内额外触发：提到「{'、'.join(policy.name_hits)}」即回；"
               f"话题相关时再用一次轻量判定（回看 {cfg['trigger'].get('context_lookback', 8)} 条）")
+    print(uns.describe())
     print(f"模式：{'DRY-RUN（不发送）' if args.dry_run else '正式（会真的发送）'}")
     print(f"回复日志 → {REPLY_LOG}\n", flush=True)
 
     lst = Listener(db, interval=1.0)
 
-    def on_msg(msg: dict, _lst: Listener):
-        payload = build_payload(db, resolver, msg)
-        # 上下文先取好：既给「是不是在说我」判定用，也给正式生成回复用
-        history = build_history(
-            db, resolver, payload["chat_username"],
-            int(cfg["ai"].get("history_limit", 8)), msg.get("local_id"),
-        )
-        ok, reason = policy.check(payload, history)
-        if not ok:
-            # 常见情况静默（否则群里每条消息都刷一行），只报异常原因
-            if reason not in QUIET_REASONS and not reason.startswith("非文本"):
-                print(f"  · 跳过 {payload['chat_name']} | {reason}", flush=True)
-            return
-        log_line(f"[{payload['time']}] 收到 {payload['chat_name']} | {payload['sender']}: {payload['content']}")
-        # 注入该会话的记忆档案（没有就是空串）
-        mem_block = ""
+    def build_mem_block(payload: dict) -> str:
+        """记忆档案 + 本群成员名单（两块都注入，避免认错人/编名字）。"""
+        block = ""
         if cfg["ai"].get("memory", {}).get("enabled", True):
             try:
-                mem_block = memory_store.prompt_block(memory_store.load(payload["chat_username"]))
+                block = memory_store.prompt_block(memory_store.load(payload["chat_username"]))
             except Exception as e:  # noqa: BLE001
                 print(f"  [读取记忆失败] {type(e).__name__}: {e}", flush=True)
-        if mem_block:
-            print(f"  · 已注入 {payload['chat_name']} 的记忆档案", flush=True)
-
-        # 群聊：注入「本群成员名单」，避免认错人 / 编造名字
+            if block:
+                print(f"  · 已注入 {payload['chat_name']} 的记忆档案", flush=True)
         if payload["is_group"]:
             try:
                 roster = resolver.roster(payload["chat_username"])
                 names = [n for w, n in roster.items() if n and w != resolver.me]
                 if names:
-                    mem_block += ("\n\n【本群成员（当前昵称）】" + "、".join(names[:60])
-                                  + "\n称呼别人只能用这些名字或聊天记录里出现过的名字，"
-                                    "绝不要自己编名字；不确定是谁就直接问。")
+                    block += ("\n\n【本群成员（当前昵称）】" + "、".join(names[:60])
+                              + "\n称呼别人只能用这些名字或聊天记录里出现过的名字，"
+                                "绝不要自己编名字；不确定是谁就直接问。")
                     print(f"  · 已注入本群 {len(names)} 位成员名单", flush=True)
             except Exception as e:  # noqa: BLE001
                 print(f"  [读取群成员失败] {type(e).__name__}: {e}", flush=True)
+        return block
 
-        reply = ai_reply(cfg["ai"], payload["content"], payload["sender"], payload["chat_name"],
-                         payload["is_group"], history, me_name=info.get("nick_name") or "",
-                         mem_block=mem_block)
+    def on_msg(msg: dict, _lst: Listener):
+        payload = build_payload(db, resolver, msg)
+        # 上下文先取好：既给「是不是在说我」判定用，也给生成回复用
+        history = build_history(
+            db, resolver, payload["chat_username"],
+            int(cfg["ai"].get("history_limit", 8)), msg.get("local_id"),
+        )
+        ok, reason = policy.check(payload, history)
+        unsolicited = False
+        if not ok:
+            # 没人点我，但群里有人问了个我能答的问题 → 主动接一句
+            ok, ureason = uns.check(payload, history, uns.api_key)
+            if not ok:
+                # 常见情况静默（否则群里每条消息都刷一行），只报异常原因
+                if reason not in QUIET_REASONS and not reason.startswith("非文本"):
+                    print(f"  · 跳过 {payload['chat_name']} | {reason}"
+                          f"{'' if ureason in ('不是在问问题', '主动接话未开启', '私聊不主动')
+                             else ' / 主动接话：' + ureason}", flush=True)
+                return
+            unsolicited = True
+            log_line(f"[{payload['time']}] 主动接话 {payload['chat_name']} | "
+                     f"{payload['sender']} 问：{payload['content']}")
+
+        ms = dict(cfg["ai"].get("multi_send") or {})
+        sep = ms.get("separator", "|||") if ms.get("enabled", True) else ""
+        me_name = info.get("nick_name") or ""
+
+        if unsolicited:
+            reply = unsolicited_fill(cfg["ai"], me_name, payload["chat_name"],
+                                     payload["sender"], payload["content"], history,
+                                     build_mem_block(payload))
+        else:
+            if not history:
+                history = build_history(
+                    db, resolver, payload["chat_username"],
+                    int(cfg["ai"].get("history_limit", 8)), msg.get("local_id"),
+                )
+            log_line(f"[{payload['time']}] 收到 {payload['chat_name']} | "
+                     f"{payload['sender']}: {payload['content']}")
+            reply = ai_reply(cfg["ai"], payload["content"], payload["sender"], payload["chat_name"],
+                             payload["is_group"], history, me_name=me_name,
+                             mem_block=build_mem_block(payload))
         if not reply:
             log_line("  AI 未生成回复，跳过")
             return
         # 一次可以说好几句：开了分隔符就分条发，否则整段一条（多行保留）
-        ms = dict(cfg["ai"].get("multi_send") or {})
-        sep = ms.get("separator", "|||") if ms.get("enabled", True) else ""
         texts = parse_multi(reply, sep, int(ms.get("max_messages", 3)))
         policy.mark(payload["chat_username"])
-        if sched is not None:
-            sched.note_activity(payload["chat_username"])   # 人在说话，别去主动开话题
+        if unsolicited:
+            uns.mark(payload["chat_username"])
         if send_multi(texts, payload["chat_username"], payload["chat_name"])[0]:
             # 异步更新记忆档案（不阻塞、不影响回复延迟）
             if cfg["ai"].get("memory", {}).get("enabled", True):
@@ -995,17 +1056,6 @@ def main():
                     daemon=True,
                 ).start()
 
-    # 主动开话题：后台线程，只在列进 proactive.chats 的群里说话
-    stop_event = threading.Event()
-    if sched.chats:
-        print(f"主动开话题：{'、'.join(sched.chats)} "
-              f"（空闲 ≥{sched.p.get('min_idle_minutes', 40)} 分钟才开口，"
-              f"每天最多 {sched.p.get('max_per_day', 6)} 次"
-              f"{'，已开启' if sched.p.get('enabled', False) else '，未开启（enabled=false）'}）")
-        if sched.p.get("enabled", False):
-            threading.Thread(target=sched.loop, args=(stop_event, args.dry_run),
-                             daemon=True).start()
-
     lst.add_all(on_msg, discover=True)
     lst.start()
     print("机器人运行中（Ctrl+C 停止）...", flush=True)
@@ -1015,7 +1065,6 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        stop_event.set()
         lst.stop()
         print("\n已停止。")
     return 0
