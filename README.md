@@ -166,6 +166,7 @@ python tools/probe_send_filehelper.py   :: 端到端发送自测（默认只输�
 python tools/probe_focus_after_open.py  :: 实测打开会话后焦点是否已在输入框
 python tools/probe_image_read.py        :: 验证「对方发的图片」能否读出并解密（只读，不发送）
 python tools/probe_recent.py --chat 某群 :: 打印某会话最近消息（查「它为什么说那句话」）
+python tools/probe_my_voice.py          :: 打印你自己发过的消息（改说话口吻前先看这个）
 ```
 
 > ⚠️ 自测请一律用**文件传输助手**（`filehelper`，它在 `skip_chats` 里，机器人不会回复它），
@@ -439,6 +440,23 @@ OCR 回退路径 `input_text`（`set_clipboard` + `Ctrl+V`）。如果开了剪�
 > 用「在 system prompt 里禁止它提某个词」来兜底是**下策**：那等于把那个词高亮给模型看，
 > 上下文里真有它，弱推理档（`reasoning_effort: low`）就会被带跑。
 > **过滤掉，比下指令可靠。**
+
+### 19. 口吻就是一段 prompt，别在代码里写死
+
+「像谁说话」完全交给 `ai.system_prompt` 里的**风格段**（本项目默认是按「昔涟」那种
+温柔、慢半拍、带一点比喻的语气写的；公开仓库里标题参数化成 `【说话的语气】`，
+你可以整段换成任意人设）。改口吻时**别碰**后面的安全红线与输出约束——那些是功能，不是风格。
+
+调口吻的正确姿势（都**不发送消息**）：
+
+```bat
+python tools/probe_my_voice.py      :: 先看你「自己」平时怎么打字（自动挑发言最多的会话）
+python tools\preview_replies.py     :: 改完 prompt，预览 15 条典型场景的实际回复
+```
+
+> 经验：想让机器人像某个真实的人，**用那个人自己的聊天记录当依据**比查百科、凭印象准得多
+> ——语气词、句子长短、爱用不用感叹号，这些小事骗不了人。
+> 若是虚构角色，让用户直接贴几句台词当样本，胜过任何二手转述。
 
 ## 致谢
 
