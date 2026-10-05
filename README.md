@@ -62,6 +62,7 @@ pip install -r requirements.txt
     "thinking": true,
     "reasoning_effort": "low",
     "history_limit": 20,
+    "history_max_age_minutes": 60,
     "max_tokens": 1200,
     "max_chars": 220,
     "system_prompt": "...",
@@ -128,6 +129,7 @@ pip install -r requirements.txt
 | `trigger.group_image` | 群里收到图片是否也接（开了之后，只在「这个群 300 秒内有人说过话」时才接，见下一行） |
 | `ai.image.group_recent_seconds` | 群图片的活跃窗口（默认 300）：只接**正在进行**的对话；设 0 = 不限（群里每张图都看，费 token） |
 | `ai.image.detail` | `low`（默认，先缩到 512×512，快且省）／`original`（要看清小字时用） |
+| `ai.history_max_age_minutes` | 上下文只带这么久以内的消息（默认 60，`0`=不限）。群安静时「最近 N 条」会翻回几小时前，把无关旧话喂给模型，见下节 |
 
 **API Key** 按顺序从这些位置找（都不会被写进仓库）：
 
@@ -423,6 +425,20 @@ OCR 回退路径 `input_text`（`set_clipboard` + `Ctrl+V`）。如果开了剪�
 
 > 自查脚本 `tools/measure_effort.py` 会同时统计**空回复条数**——任何「让它别说什么」的
 > 提示词改动后都该跑一次，光看回复内容好看是发现不了它哑掉的。
+
+### 18. 上下文要加时间窗：别让几小时前的旧话污染正在聊的天
+
+只按条数取「最近 N 条」有个坑：**群一安静，这 N 条能一路翻回几小时前**，
+把跟当下无关的旧消息（比如自己调试时发的测试内容）当成「正在聊的话题」喂给模型，
+模型就会顺着那些旧话接茬，说出不该说的话。
+
+`ai.history_max_age_minutes`（默认 60）只保留窗口内的消息；窗口内不足 3 条时退回最近 3 条，
+**绝不把上下文清空**（清空会让「话题轮到我」的判定失准）。副作用是好的：闲聊少的群
+上下文自然变短，**token 也省了**。设为 `0` 可回到旧行为。
+
+> 用「在 system prompt 里禁止它提某个词」来兜底是**下策**：那等于把那个词高亮给模型看，
+> 上下文里真有它，弱推理档（`reasoning_effort: low`）就会被带跑。
+> **过滤掉，比下指令可靠。**
 
 ## 致谢
 
