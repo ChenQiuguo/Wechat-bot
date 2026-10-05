@@ -11,6 +11,7 @@
     "temperature": 1.2,
     "timeout": 30,
     "history_limit": 20,
+    "history_max_age_minutes": 60,
     "memory": {
       "enabled": true,
       "max_facts": 25,

@@ -172,17 +172,25 @@ def load_api_key() -> str:
 # --------------------------------------------------------------------------
 
 def build_history(db: WeChatDB, resolver: "SenderResolver", chat_username: str,
-                  limit: int = 8, exclude_local_id=None) -> list:
+                  limit: int = 8, exclude_local_id=None, max_age_minutes: int = 0,
+                  min_recent: int = 3) -> list:
     """取该会话最近若干条消息作为上下文。
 
     纯文本才喂给模型；媒体消息只留一个占位说明（图片的具体内容只喂当前这条，
     不然历史里每张图都要解密 + 上千 token）。
+
+    ``max_age_minutes`` > 0 时**只保留这个时间窗内的消息**：群安静的时候「最近 20 条」
+    能一路翻回几小时前，把无关的旧话（比如主人自己调试时发的测试消息）也喂进去，
+    模型会顺着那些旧话接茬。窗口内至少要留 ``min_recent`` 条，不够就放宽成「最近几条」，
+    免得把上下文清空导致判定失准。
     """
     try:
         msgs = db.get_messages(chat_username, limit=limit + 2)
     except Exception:
         return []
     lines = []
+    fresh = []
+    now = time.time()
     for m in msgs:
         if exclude_local_id is not None and m.get("local_id") == exclude_local_id:
             continue
@@ -194,11 +202,17 @@ def build_history(db: WeChatDB, resolver: "SenderResolver", chat_username: str,
         text = clean_content(_as_text(m.get("content")), mtype)
         who = "我" if is_self else name
         if not text or text.startswith("["):
-            if mtype:
-                lines.append(f"{who}: [发了一张图片]" if mtype == "图片"
-                             else f"{who}: [{mtype}]")
-            continue
-        lines.append(f"{who}: {text}")
+            if not mtype:
+                continue
+            line = f"{who}: [发了一张图片]" if mtype == "图片" else f"{who}: [{mtype}]"
+        else:
+            line = f"{who}: {text}"
+        lines.append(line)
+        if max_age_minutes and (now - float(m.get("create_time") or 0)) <= max_age_minutes * 60:
+            fresh.append(line)
+    if max_age_minutes:
+        # 窗口内太少就退回「最近几条」，别把上下文清空
+        lines = fresh if len(fresh) >= int(min_recent) else lines[-max(int(min_recent), 1):]
     return lines[-limit:]
 
 
@@ -1535,6 +1549,7 @@ def main():
         history = build_history(
             db, resolver, payload["chat_username"],
             int(cfg["ai"].get("history_limit", 8)), msg.get("local_id"),
+            max_age_minutes=int(cfg["ai"].get("history_max_age_minutes", 0) or 0),
         )
         ok, reason = policy.check(payload, history)
         unsolicited = False
