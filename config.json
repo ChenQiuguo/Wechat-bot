@@ -1,10 +1,11 @@
 {
+  "_status": "一套**微信 4.x 自动回复机器人**，本机正在运行：私聊自动回复、群里被 @ 或**被叫名字/话题轮到自己**时回复、**群里有人问了能答的问题会主动接**（默认关）、带 20 条上下文、开思考模式、**回复一句一条发**、**发送不碰剪贴板**、有联系人记忆档案、带安全红线、**多账号守卫**。**图片目前已按要求关掉（只回文字）**，看图代码还在，怎么重开见 §7.9。这句话由 `update_handoff.py` 自动同步进 §0.1。",
   "ai": {
     "provider": "deepseek",
     "base_url": "https://api.deepseek.com",
     "model": "deepseek-flash",
     "thinking": true,
-    "reasoning_effort": "high",
+    "reasoning_effort": "low",
     "max_tokens": 1200,
     "max_chars": 220,
     "temperature": 1.2,
@@ -48,10 +49,9 @@
     "context_lookback": 8,
     "judge_cooldown": 8,
     "types": [
-      "文本",
-      "图片"
+      "文本"
     ],
-    "group_image": true,
+    "group_image": false,
     "max_age_seconds": 120
   },
   "limits": {

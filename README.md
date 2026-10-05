@@ -60,9 +60,9 @@ pip install -r requirements.txt
     "base_url": "https://api.deepseek.com",
     "model": "deepseek-flash",
     "thinking": true,
-    "reasoning_effort": "high",
+    "reasoning_effort": "low",
     "history_limit": 20,
-    "max_tokens": 800,
+    "max_tokens": 1200,
     "max_chars": 220,
     "system_prompt": "...",
     "multi_send": {
@@ -163,6 +163,7 @@ python tools/bench_send.py 3            :: 对比两种发送路径的耗时
 python tools/probe_send_filehelper.py   :: 端到端发送自测（默认只输入不发送；只发文件传输助手）
 python tools/probe_focus_after_open.py  :: 实测打开会话后焦点是否已在输入框
 python tools/probe_image_read.py        :: 验证「对方发的图片」能否读出并解密（只读，不发送）
+python tools/probe_recent.py --chat 某群 :: 打印某会话最近消息（查「它为什么说那句话」）
 ```
 
 > ⚠️ 自测请一律用**文件传输助手**（`filehelper`，它在 `skip_chats` 里，机器人不会回复它），
@@ -400,6 +401,28 @@ OCR 回退路径 `input_text`（`set_clipboard` + `Ctrl+V`）。如果开了剪�
 
 另一个取舍：历史上下文里的图片只留 `[发了一张图片]` 占位，**不把历史图也解密喂进去**
 （否则每张历史图都是上千 token）；只有当前这条消息的图会真的给模型看。
+
+### 17. `reasoning_effort`：这个任务用 `low` 更稳，不只是更省
+
+「思考模式」的推理和正文**抢同一个 `max_tokens`**。这个项目的提示词是**重约束型**
+（十几条规则 + 红线 + 人设 + 「一句一条」的输出格式），`reasoning_effort: high` 会让模型把
+预算大量花在「这话能不能说」上——**预算被吃光时接口返回空正文，机器人就哑了**。
+
+同一批 7 条真实消息、只换 effort 的实测：
+
+| 指标 | `low` | `high` |
+|---|---|---|
+| 非空回复 | **7/7** | **6/7**（一条被思维链吃光 → 空回复） |
+| 平均 completion tokens | **253** | 607 |
+| 平均每条成本（flash 高峰） | **0.53 分** | 0.77 分 |
+| 平均耗时 | **1.3–2.9s** | 2.7–6.1s |
+| 违反硬约束（如正文出现 `@`） | **0** | 1 |
+
+**结论：闲聊型任务 + 重约束提示词 → `low`**。这类任务要的是「读懂上文 → 挑态度 → 说一句人话」，
+不是多步推理；而哑掉比答得平庸严重得多。仓库默认 `low`，`max_tokens` 给到 1200 留足余量。
+
+> 自查脚本 `tools/measure_effort.py` 会同时统计**空回复条数**——任何「让它别说什么」的
+> 提示词改动后都该跑一次，光看回复内容好看是发现不了它哑掉的。
 
 ## 致谢
 
