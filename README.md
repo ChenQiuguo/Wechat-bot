@@ -1,468 +1,244 @@
-# 微信 AI 自动回复机器人
+# Wechat-bot — 微信 4.x AI 自动回复机器人
 
-基于 [wechatauto-replica](https://pypi.org/project/wechatauto-replica/) 的微信 4.x 自动回复机器人：
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
+[![DeepSeek](https://img.shields.io/badge/DeepSeek-API-green.svg)](https://platform.deepseek.com/)
+[![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-- **私聊**收到消息 → AI 生成回复并发送
-- **群聊**里有人 **@我** → 同上
-- 自己发的消息永不回复（防自杀循环）
+> 一套**微信 4.x 自动回复机器人**：私聊自动回复、群里被 @ 或**被叫名字/话题轮到自己**时回复、**群里有人问了能答的问题会主动接**（公开仓库默认关）、带 20 条上下文（**只取 60 分钟内的**）、开思考模式（`reasoning_effort=low`）、**说话口吻可定制**（人设写在 `config.json` 的 `system_prompt` 里）、**回复一句一条发**、**发送不碰剪贴板**、有联系人记忆档案、带安全红线、**多账号守卫**。
 
-读消息走**本地数据库解密**（只读，不注入 DLL、不改微信文件），发消息走 **UIA 自动化**。
+**最新更新（v1.2.1，2026-10-25）**：
+- 🔧 修复私聊消息收不到 + 同一条消息被重复记录 4 次的问题
 
-> ⚠️ **免责声明**：这属于违反微信用户协议的非官方操作，**存在风控/封号风险**。
-> 本项目只做只读监听 + 低频发送，但仍不等于零风险。请自行评估，建议用小号测试。
-> 有统计显示 Hook 类方案约 85% 的用户被封过号；本项目不注入进程，风险低于 hook，
-> 但风控是概率问题，没有绝对安全。
+**v1.2.0（2026-10-24）**：
+- ✅ **GUI 图形界面**（`bot_gui.py`，大字号清晰界面，工具栏在顶部）
+- ✅ **文件 IPC**（`bot_state.py`）—— `bot_status.json` + `bot_events.jsonl`
+- ✅ **依赖自愈**（`start_bot.bat` / `restart_bot.bat`）—— 启动前检查 wechatauto/psutil，缺则自动 pip install
+- ✅ **参数调优** —— temperature=1.2, max_chars=220
+- 🌸 **梦幻主题 GUI** —— 纯洁白 + 柔粉 + 冰晶蓝绿，无黑色圣洁风
 
 ---
 
-## 功能
+## 目录
 
-| 能力 | 说明 |
-|---|---|
-| 私聊自动回复 | AI 生成，带聊天上下文 |
-| 群聊 @ 自动回复 | 自动识别 `@本账号昵称` |
-| **提到名字也回** | 没被 @、但正文里叫了本账号的名字，或接着上文问关于他的事，也会接话（靠一次轻量判定，拿不准就答否） |
-| **主动接问题** | 群里没人点他，但有人问了个他确实答得上来的具体问题，会主动接一句；答不上来或只是闲聊就不插话（默认关闭） |
-| **看图** | 对方**发图片**也能看懂（截图、照片、图表里的字都认）。图片从本地缓存解密，**不点开图片、不驱动界面**；私聊直回，群里只在「这个群最近 300 秒有人说话」时接（默认关闭，见配置） |
-| **一句一条** | 回复按句子自动拆开、一句一条发出去，像真人打字；可切回「整段一条」 |
-| **不碰剪贴板** | 发送走 `SendInput` Unicode 逐字注入，**不写系统剪贴板**（对开了剪贴板多端同步的人很重要） |
-| **思考模式** | 回复前先推理（思维链），回答更有条理；可用 `reasoning_effort` 调强度 |
-| **联系人记忆** | 每个会话一份小档案（关系/城市/爱好/近况/约定），回复时注入、事后异步更新 |
-| **带上下文的回复** | 每次把该会话最近 20 条消息一起给模型，能接住玩笑和梗 |
-| **会话列表点击发送** | 实测比库默认的搜索框路径**快一倍**（5.3s → 2.7s） |
-| **不点输入框** | 打开会话后焦点已在输入框，省掉那次点击（实测 **17.4s → 1.2s**，因为探测输入框要走截屏/OCR） |
-| 冷却与限流 | 每会话冷却、每分钟/每天上限，防刷屏防风控 |
-| 防重复启动 | 单实例锁，陈旧锁自动回收 |
-| **账号守卫** | 多账号时上游按「库最后改动」挑账号；本程序启动即锁定账号，运行中一旦发现换号**立刻停手**，避免把「自己发的消息」当成别人发的而回复自己 |
-| 回复风格可配置 | 默认正常口语（正经问题正经答，贫嘴时才偶尔皮一下），随便改 prompt |
-| 安全边界 | 不许替你答应借钱/邀约、不许编造行程与权限、不参与敏感话题、不泄露身份 |
+- [特性](#特性)
+- [快速开始](#快速开始)
+- [架构](#架构)
+- [配置](#配置)
+- [安全红线](#安全红线)
+- [更新日志](#更新日志)
+- [贡献](#贡献)
+- [许可](#许可)
 
-## 环境要求
+---
 
-- Windows 10/11
-- 微信 PC 客户端 **4.x**，**已登录并保持在线**（4.1.9.35 实测可用）
-- Python **3.9+**（3.12 实测）
-- 一个 OpenAI 兼容的大模型 API（默认 DeepSeek）
+## 特性
 
-## 安装
+### 核心功能
+- **私聊自动回复**：收到私聊消息自动回复
+- **群聊智能触发**：
+  - 被 @ 时回复
+  - 被叫名字时回复
+  - 话题轮到自己时回复（上下文判断）
+  - 刚回过的人 90 秒内再说一句也接
+- **一句一条发**：多句回复拆成多条消息发送，更自然
+- **上下文记忆**：带 20 条上下文（只取 60 分钟内的）
+- **思考模式**：开启 `reasoning_effort=low`，平衡质量与速度
+- **发送不碰剪贴板**：用 UIA 注入，不干扰用户剪贴板
+- **联系人记忆档案**：自动记住联系人信息
+- **多账号守卫**：检测到账号切换自动停止
+- **发送确认**：发完回读数据库确认，失败自动重试
+- **回调异常兜底**：`on_msg` 包 try/except，单条消息异常不会导致后续消息收不到
 
-```bat
-pip install -r requirements.txt
+### GUI 图形界面（v1.2.0 新增）
+- **状态栏**：微信在线 / 机器人运行 / 账号 / 模式 / 今日回复数 / 最后消息时间
+- **对话流**：实时滚动显示收发消息，按会话分色
+- **系统日志**：收发/警告/错误/启动等系统事件
+- **工具栏**（顶部）：启动/停止/重启机器人、打开日志、打开配置、清空对话
+- **文件 IPC**：`bot_status.json` + `bot_events.jsonl`，跨进程实时同步
+- **高DPI适配**：`SetProcessDpiAwareness`，高分屏不模糊
+- **大字号界面**：对话 13pt、状态栏 12pt、按钮 12pt 加粗，清晰易读
+- **梦幻主题**：纯洁白基底 + 柔粉 + 冰晶蓝绿，无黑色圣洁风（♪♡ 装饰）
+
+### 依赖自愈（v1.2.0 新增）
+- 启动脚本自动检查依赖（`wechatauto` + `psutil`）
+- 缺失时自动 `pip install`，无需手动干预
+
+### 安全特性
+- **绝不发送真实姓名**：聊天记录、日志、文档里都不能出现真人名
+- **绝不发送 API key**：`apikey.txt` 已 gitignore
+- **绝不向非 filehelper 发测试消息**：自测只能发「文件传输助手」
+- **绝不绕过 verify**：`send.verify=true` 保持开启
+- **绝不删除红线段**：`config.json` 的红线部分字节级不变
+
+---
+
+## 快速开始
+
+### 前置要求
+
+1. **Windows 10/11**
+2. **Python 3.10+**
+3. **微信 4.x**（已登录）
+4. **DeepSeek API Key**（[申请地址](https://platform.deepseek.com/)）
+
+### 安装
+
+```powershell
+# 1. 克隆仓库
+git clone https://github.com/ChenQiuguo/Wechat-bot.git
+cd Wechat-bot
+
+# 2. 安装依赖
+pip install wechatauto-replica==1.2.4.4 psutil
+
+# 3. 配置 API Key
+echo "sk-your-api-key" > apikey.txt
+
+# 4. 启动 GUI（推荐）
+python bot_gui.py
+
+# 或启动命令行版本
+python wx_bot.py
 ```
+
+### Windows 用户（一键启动）
+
+双击 `start_bot.bat`（含依赖自愈，首次会自动安装依赖）
+
+---
+
+## 架构
+
+```
+微信 4.x 客户端
+  ↓ (UIA / 数据库读取)
+wx_bot.py (主程序)
+  ├── db.get_nickname() → 显示名解析
+  ├── send_multi() → 逐条发送 + verify
+  ├── BUS = BotStateBus() → 写 bot_status.json + bot_events.jsonl
+  └── bot_replies.log
+        ↓ (文件 IPC)
+bot_gui.py (GUI，Tkinter)
+  ├── BotStateReader → 读 bot_status.json + bot_events.jsonl
+  ├── 每 200ms 轮询状态 + 事件
+  └── 每 2s 检查 bot.lock + psutil 进程存活
+```
+
+### 核心文件
+
+| 文件 | 用途 |
+|---|---|
+| `wx_bot.py` | 机器人主程序 |
+| `bot_gui.py` | GUI 图形界面 |
+| `bot_state.py` | 文件 IPC（状态 + 事件） |
+| `config.json` | 配置文件 |
+| `apikey.txt` | API Key（gitignored） |
+| `start_bot.bat` | 启动脚本（含依赖自愈） |
+| `restart_bot.bat` | 重启脚本（含依赖自愈） |
+| `stop_bot.bat` | 停止脚本 |
+
+---
 
 ## 配置
 
-编辑 `config.json`：
+**配置文件：** `config.json`
 
-```json
-{
-  "ai": {
-    "base_url": "https://api.deepseek.com",
-    "model": "deepseek-flash",
-    "thinking": true,
-    "reasoning_effort": "low",
-    "history_limit": 20,
-    "history_max_age_minutes": 60,
-    "max_tokens": 1200,
-    "max_chars": 220,
-    "system_prompt": "...",
-    "multi_send": {
-      "enabled": true,
-      "mode": "sentence",
-      "max_chars_per_message": 60,
-      "max_messages": 4,
-      "separator": "|||"
-    },
-    "image": {
-      "enabled": false,
-      "detail": "low",
-      "max_bytes": 8388608,
-      "save_dir": "",
-      "private_require_recent": false,
-      "recent_window_seconds": 1800,
-      "group_recent_seconds": 300
-    }
-  },
-  "input": {
-    "method": "unicode",
-    "char_delay": 0.012,
-    "fallback_clipboard": false,
-    "click_input": false
-  },
-  "trigger": {
-    "private": true,
-    "group_at": true,
-    "at_names": [],
-    "name_hits": [],
-    "context_judge": true,
-    "context_lookback": 8,
-    "types": ["文本", "图片"],
-    "group_image": true,
-    "max_age_seconds": 120
-  },
-  "limits": {
-    "per_chat_cooldown": 2,
-    "max_replies_per_minute": 20,
-    "max_replies_per_day": 300
-  },
-  "unsolicited": {
-    "enabled": false,
-    "per_chat_cooldown": 480,
-    "max_per_minute": 2,
-    "max_per_day": 10
-  },
-  "rhythm": "fast"
-}
+### 关键参数
+
+| 参数 | 值 | 说明 |
+|---|---|---|
+| `ai.temperature` | 1.2 | 输出随机性（越高越发散） |
+| `ai.max_chars` | 220 | 回复最大长度（字符） |
+| `ai.max_tokens` | 1200 | 生成上限（token） |
+| `ai.reasoning_effort` | low | 思考深度（low/medium/high） |
+| `ai.thinking` | true | 是否开启思考模式 |
+| `ai.model` | deepseek-flash | 模型选择 |
+| `trigger.private` | true | 私聊自动回复 |
+| `trigger.group_at` | true | 群里 @ 或叫名字时回复 |
+| `trigger.group_followup_seconds` | 90 | 刚回过的人 90 秒内再说一句也接 |
+| `trigger.context_judge` | true | 判断话题是否轮到自己 |
+| `limits.per_chat_cooldown` | 2 | 每个会话冷却 2 秒 |
+| `limits.max_replies_per_day` | 300 | 每天最多 300 条 |
+| `rhythm` | fast | 发送节奏 |
+
+### 换 API Key
+
+只改 `apikey.txt` 一行，重启 bot 生效：
+
+```powershell
+echo "sk-new-api-key" > apikey.txt
 ```
 
-`at_names` / `name_hits` 留空即可——运行时会**自动把本账号昵称加进去**，不用写死。
+### 自定义口吻
 
-几个容易搞混的开关：
-
-| 开关 | 作用 |
-|---|---|
-| `ai.multi_send.mode` | `sentence`＝一句一条（默认）；`separator`＝只在模型写 `\|\|\|` 处切；`enabled:false`＝整段一条 |
-| `input.method` | `unicode`＝只用键盘注入（默认）；`auto`＝注入失败可回退剪贴板；`clipboard`＝不打补丁 |
-| `trigger.context_judge` | 没人点你时，是否花一次轻量判定决定「要不要接话」 |
-| `unsolicited.enabled` | 群里有人问了能答的问题时是否**主动**接一句（默认关，开了也只在群聊、私聊永不主动） |
-| `ai.image.enabled` | 是否**看图**：对方发图片时把图片内容一起给模型（默认关；视觉调用比文本贵，1 张图≈1000 token） |
-| `trigger.group_image` | 群里收到图片是否也接（开了之后，只在「这个群 300 秒内有人说过话」时才接，见下一行） |
-| `ai.image.group_recent_seconds` | 群图片的活跃窗口（默认 300）：只接**正在进行**的对话；设 0 = 不限（群里每张图都看，费 token） |
-| `ai.image.detail` | `low`（默认，先缩到 512×512，快且省）／`original`（要看清小字时用） |
-| `ai.history_max_age_minutes` | 上下文只带这么久以内的消息（默认 60，`0`=不限）。群安静时「最近 N 条」会翻回几小时前，把无关旧话喂给模型，见下节 |
-
-**API Key** 按顺序从这些位置找（都不会被写进仓库）：
-
-1. 环境变量 `DEEPSEEK_API_KEY`
-2. 本项目目录下的 `apikey.txt`（可直接写一行裸 key）
-3. `~/.dsh/.credentials.yaml`（DeepSeek Harness 的凭据文件，可选）
-
-## 使用
-
-```bat
-python wx_bot.py                       :: 正式运行
-python wx_bot.py --dry-run             :: 只生成回复不发送（安全预览）
-python wx_bot.py --test-reply "你好"    :: 走完整 AI+发送流程（发到文件传输助手）
-python wx_bot.py --test-image D:\a.jpg  :: 试「看图」：给一张本地图，看它看懂没（默认不发）
-python wx_bot.py --test-image 某个群     :: 试「看图」：拿该会话最近一张图片来试
-python wx_push.py --webhook http://...  :: 只监听并推送 JSON（不回复）
-```
-
-Windows 上双击 `start_bot.bat` 即可（会自动找 Python、检查微信是否在运行、检查依赖）。
-
-## 工具
-
-```bat
-python doctor.py                        :: 自检：密钥提取/解密/会话/消息读取
-python tools/probe_self_id.py           :: 推导本机「自己」的 sender_id
-python tools/check_account.py --chats   :: 账号自检：当前连的是哪个号、自身判定有没有错位
-python tools/export_history.py --list   :: 列出有消息的会话（导出留档用）
-python tools/export_history.py --who 某人 :: 导出某会话全部聊天记录（Markdown/JSONL/txt）
-python tools/verify_payload.py          :: 用真实历史消息验证发送者解析与正文清洗
-python tools/preview_replies.py         :: 预览一批典型/刁钻消息的 AI 回复
-python tools/measure_tokens.py          :: 实测单次回复的 token 消耗与成本
-python tools/bench_send.py 3            :: 对比两种发送路径的耗时
-python tools/probe_send_filehelper.py   :: 端到端发送自测（默认只输入不发送；只发文件传输助手）
-python tools/probe_focus_after_open.py  :: 实测打开会话后焦点是否已在输入框
-python tools/probe_image_read.py        :: 验证「对方发的图片」能否读出并解密（只读，不发送）
-python tools/probe_recent.py --chat 某群 :: 打印某会话最近消息（查「它为什么说那句话」）
-python tools/probe_my_voice.py          :: 打印你自己发过的消息（改说话口吻前先看这个）
-```
-
-> ⚠️ 自测请一律用**文件传输助手**（`filehelper`，它在 `skip_chats` 里，机器人不会回复它），
-> 不要拿真人群当靶子。
+`config.json` → `ai.system_prompt` 就是机器人的说话口吻（人设、规则、红线都在里面）。改成你自己的角色即可。
 
 ---
 
-## 实现要点与踩坑记录
+## 安全红线
 
-这部分是折腾出来的经验，对想基于同类库做微信自动化的人应该有用。
-
-### 1. 「自己发的」不能按 `sender_id == 2` 判断
-
-上游库在 `db.py` 里写死了「`sender_id == 2` 就是自己」，并据此跳过用户名解析。但
-`real_sender_id` 是 `message_resource.db` 里 `SenderName2Id` 表的 rowid，**每台机器不一样**。
-本机实测：自身 rowid 是 **3**，而 `id=2` 其实是一位好友。
-
-照库的写法会出两个错：群里那位好友的消息被**误判成你自己发的**，而且名字解析被跳过
-（正文里的 `wxid_xxx:` 前缀都没剥掉）。
-
-**解决**：从「文件传输助手」反推自身 rowid——那里的消息必然全是自己发的：
-
-```python
-msgs = db.get_messages("filehelper", limit=200)
-self_id = Counter(m["sender_id"] for m in msgs).most_common(1)[0][0]
-```
-
-并且**绕过库里的 `!= 2` 判断**，直接用 `SenderName2Id` 映射表解析发送者。
-
-### 2. 发送路径：会话列表点击比搜索框快一倍（实测）
-
-库默认发送流程是「打开搜索框 → 输入昵称 → 等搜索结果 → 点结果 → 输入正文 → 发送」。
-而刚给你发消息的人**就在左侧会话列表顶部**，直接点它更快。
-
-| 路径 | 平均耗时 | 打开会话 |
-|---|---|---|
-| 搜索框（库默认） | 5.3s | ~3.5s |
-| **UIA 会话列表点击** | **2.7s** | **~1.3s** |
-
-实现见 `open_chat_via_session_list()`：枚举 `session_list`（`mmui::XTableView`）下的
-`ListItemControl`，按首行会话名精确匹配、点矩形中心、用 `current_chat()` 复核；
-匹配不到/同名多个/点击失败时**自动回退搜索框**。
-
-> **关键坑**：不要用库自带的 OCR 侧栏路径（`guia.find_session`）做这件事。它靠屏幕截图 +
-> 文字识别，实测要 **17–24 秒且打开成功率 0/3**。原因之一是 Windows 会把**最小化**的窗口
-> 放到 `(-32000, -32000)`，截图类路径完全失效。**必须走 UIA**。
-
-### 3. 库的 `verify=True` 会误报失败
-
-`send_msg(..., verify=True)` 靠回读数据库确认发送。但微信写盘有延迟（实测约 2 秒），
-库的检查窗口太短，会报「消息已操作发送，但数据库未确认」——**消息其实已经发出去了**。
-
-**解决**：用 `verify=False`，需要时自己延迟复查数据库。
-
-### 4. 单实例锁（很容易踩）
-
-两个进程同时用这个库会抢解密缓存，第二个必然报：
-
-```
-PermissionError: [WinError 5] 拒绝访问: ...\.tmp -> ...\contact__contact.db
-```
-
-本项目用 pid 锁文件实现单实例，并且**进程被强杀留下的陈旧锁会自动回收**（比对 pid 是否存活）。
-
-### 5. `.bat` 文件必须是纯 ASCII + CRLF
-
-cmd 按**系统代码页**读取批处理文件，不认 UTF-8。写成 UTF-8 中文会让 cmd 把 `echo` 语句
-当成命令执行，报出这种莫名其妙的错：
-
-```
-'格）' is not recognized as an internal or external command
-```
-
-所以批处理本身只用英文，中文提示统一交给 Python 输出（`chcp 65001` 下正常）。
-另外 LF-only 换行也可能让 `goto` 标签失效，所以用 CRLF。
-
-### 6. 回复质量：光改 prompt 不够，得给上下文
-
-最初每次只把孤立的一句话丢给模型，结果：「你要@我」被误解、动不动就"我先确认一下"兜底、
-把自己当成第三方（"我得先问下他本人"）。
-
-**解决**：每次调用带上该会话最近 8 条消息，并明确告知「你就是昵称本人」。之后：
-接得住玩笑、明白话里有话、不再 @ 自己。
-
-### 7. 安全边界（防止它替你闯祸）
-
-prompt 里写死了这些规则，实测有效：
-
-- **借钱/转账/担保、答应或拒绝邀约、承诺时间、透露隐私** → 一律回「这事我确认下再回你」，
-  且**不许编理由推脱**（早期版本会回「我最近也紧巴巴的，实在匀不出来」——等于替你拒了别人）
-- **不许编造有后果的事实**：行程、当前状态（在忙/在路上）、承诺、金额、权限
-  （踢人/封禁/举报/删号）。早期版本回怼网友时说「你再说这种话我就直接踢了」——**而你并不是群主**
-- **必须与聊天记录一致**：上文说自己还卡着没过，就不能说已经过了
-
-### 8. Token 成本（实测）
-
-只有「生成回复」花钱：监听、规则判断、冷却跳过、@ 判定全是本地操作，**0 token**。
-
-实测一次回复（`deepseek-flash` + 思考模式 + 20 条上下文 + 记忆注入）：
-
-| 项目 | 数量 | 说明 |
-|---|---|---|
-| 输入（缓存命中） | 896 tokens | 固定的 system_prompt 等前缀 |
-| 输入（未命中） | 164 tokens | 最近 20 条聊天记录 + 收到的消息 + 记忆档案 |
-| **输出·思维链** | **371 tokens** | 思考模式开销，占输出 97% |
-| 输出·回复正文 | 12 tokens | |
-| **合计** | **~1443 tokens** | |
-
-按 [DeepSeek 官方价目表](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)折算：
-
-| 配置 | 高峰时段 | 空闲时段（周末/节假日全天，工作日 9-12、14-18 点之外） |
-|---|---|---|
-| 当前（flash + 思考） | **0.34 分/条**（1000 条 ≈ 3.4 元） | 0.17 分/条 |
-| 关掉思考 | 约 0.05 分/条（1000 条 ≈ 0.5 元） | 约 0.025 分/条 |
-
-按 `max_replies_per_day: 300` 上限，当前配置**最坏一天约 1 元**。
-
-> **思考模式是成本大头**（371/383 输出 token 都是思维链）。想省就把 `reasoning_effort` 降为 `low`，
-> 或 `thinking: false`（省约 85%）。另外系统提示词会被**前缀缓存**命中（896 tokens 命中，
-> 单价约为未命中的 1/50）；调小 `history_limit`（当前 20）和 `memory.max_facts`（当前 25）
-> 能直接减少输入。回复正文本身很短，不是成本来源。
-
-### 9. 真正的发送频率天花板在库里
-
-`config.json` 的冷却只是第一道闸。上游库自带的「拟人节奏层」对每个对外写动作独立限速，
-`fast` 档实测参数：写动作最小间隔 **0.6–1.4s**、**120 秒内最多 20 次**（≈10 条/分钟）、
-撞上限后冷却 4–9 秒。所以**把冷却调到 2 秒也不会真的 2 秒一条**。
-
-这是作者为规避风控刻意加的（他的账号在激进自动化后被要求重新登录过），不建议关掉。
+**绝不能做的事：**
+1. **绝不发送真实姓名** —— 聊天记录、日志、文档里都不能出现真人名
+2. **绝不发送 API key** —— `apikey.txt` 已 gitignore
+3. **绝不向非 filehelper 发测试消息** —— 自测只能发「文件传输助手」
+4. **绝不绕过 verify** —— `send.verify=true` 保持开启
+5. **绝不删除 `config.json` 的红线段** —— system_prompt 里的红线部分字节级不变
 
 ---
 
-### 10. 联系人记忆
+## 更新日志
 
-每个会话有一份独立小档案，存在 `memory/<wxid>.json`：
+完整更新日志见 [CHANGELOG.md](CHANGELOG.md)。
 
-```json
-{
-  "username": "wxid_xxx",
-  "chat_name": "小明",
-  "facts": ["在杭州工作", "下周末去杭州出差三天", "喜欢打游戏"],
-  "updated": 1791081345.2
-}
-```
+### v1.2.1 (2026-10-25)
+- 🔧 修复私聊消息收不到 + 同一条消息被重复记录 4 次（`on_msg` 加 try/except 兜底）
 
-* **回复时注入**：档案以「关于对方的已知档案（供参考，不要直接念出来）」的形式拼进 prompt；
-* **事后异步更新**：回复发送成功后另起线程，用一次**非思考模式**的小调用把新信息合并进档案
-  （与旧条目冲突时替换、超过 `max_facts` 丢最旧的），**不阻塞回复**；
-* **抽取规则**：只记对方的稳定信息（关系、城市、职业、爱好、近况、约定），
-  **明确禁止记录主人的隐私**（真实姓名、住址、单位、账号、证件）；
-* **失败无副作用**：抽取或保存失败就保留旧档案，主流程不受影响。
+### v1.2.0 (2026-10-24)
+- ✅ GUI 图形界面（大字号、高DPI适配、工具栏在顶部、梦幻主题）
+- ✅ 文件 IPC（`bot_status.json` + `bot_events.jsonl`）
+- ✅ 依赖自愈（bat 启动前自动检查安装 wechatauto/psutil）
+- 🔧 显示名解析修复（`_private_display_name()` / `_room_display_name()`）
+- ⚡ 参数调优（temperature=1.2, max_chars=220）
 
-> ⚠️ `memory/` 已写进 `.gitignore`——档案含聊天内容，**绝对不要提交**。
+### v1.1.0 (2026-10-11)
+- 🔧 运行时重置后依赖自愈 + `apikey.txt` 支持
+
+### v1.0.1 (2026-10-07)
+- 🔧 发送后回读数据库确认，修好「只输入不发送」和「重复发送」
+
+### v1.0.0 (2026-10-06)
+- ✅ 按人指定关系（`ai.relations` 机制）
 
 ---
 
-### 11. 发送别用剪贴板：`SendInput` + `KEYEVENTF_UNICODE`
+## 贡献
 
-上游发送消息**两条路都写系统剪贴板**再 `Ctrl+V`：UIA 快路径 `_paste_into`（`_clip_set` + `Ctrl+V`）、
-OCR 回退路径 `input_text`（`set_clipboard` + `Ctrl+V`）。如果开了剪贴板多端同步，
-**每发一条回复，内容就同步到手机/其它电脑一次**。
+欢迎提交 Issue 和 Pull Request！
 
-库里其实有个 `ValuePattern.SetValue` 的写法（`_set_text`）不碰剪贴板，但它注释里写明
-**不能用于聊天输入框**：SetValue 不让 Qt 控件获得焦点，而发送靠回车落到那个焦点上。
+**开发环境：**
+- Windows 10/11
+- Python 3.10+
+- 微信 4.x
 
-**解决**：`kb_input.py` 用 `SendInput` + `KEYEVENTF_UNICODE` 逐字注入，
-中英文/标点/代理对 emoji 都进得去；打完**回读输入框校验内容一致**，
-不一致就清空并交回剪贴板路径（绝不带着写了一半的输入框按回车）。
-实测发送前后剪贴板内容一字未变。
+**测试原则：**
+- 只向「文件传输助手」(filehelper) 发测试消息
+- 绝不向真人发测试
+- 测试前确认 `dry_run` 或 `send.verify=true`
 
-### 12. 打开会话后**不用**再点输入框（实测 17.4s → 1.2s）
+---
 
-`WeChatGUI.get_input_box()` 是**截屏 + OCR** 探测，不是 UIA。实测：
+## 许可
 
-| 做法 | 结果 | 耗时 |
-|---|---|---|
-| 仅 `open_chat` 后直接注入 | ✅ 落进输入框 | **1.22s** |
-| 先点会话列表那一行 | ❌ 找不到输入框控件 | — |
-| 点一下输入框再注入 | ✅ 落进输入框 | **17.42s** |
+MIT License
 
-连发（两个群来回切 3 轮共 6 次）全部落进输入框。所以补丁默认不点输入框，
-只有注入失败时才用 UIA 重开会话把焦点交回去（**不触发 OCR**）。
-
-### 13. 多账号：`sender_id` 按账号编号，换号会「回复自己」
-
-`sender_id`（`real_sender_id`）是**按登录账号编号**的。机器人启动时从 `filehelper` 反推出
-「自己是 id N」；换号后新号的自身 id 变了，**新号自己发的消息会被当成别人发的 → 机器人回复自己**。
-
-更坑的是上游挑账号的方式：`_pick_account()` 取「数据库最后被改动」的账号，不是「当前登录」的
-——两个号的库改动时间可能只差一两分钟。
-
-**解决**：`wx_bot.py` 启动时锁定账号（打印昵称/wxid/自身 sender_id，并列出本机其它账号），
-主循环每 60 秒核对一次登录账号，**一旦变了立刻停止**并写日志，宁可不出声也不误发。
-自检工具：`python tools/check_account.py --chats`。
-
-### 14. 导出聊天记录时，说话人判定别信 `sender_id == 2`
-
-同一台机器上不同账号的 `sender_id` 含义不同，所以**按账号编号硬编码「2 就是自己」必然出错**。
-`export_history.py` 用的是三条按可靠性排序的依据：
-
-1. `filehelper`（必然全是自己发的）反推「我的 id」；
-2. 私聊里的「一聊抵消」：出现的 id 只有两个，不是我的那个就是对方；
-3. 消息 XML 里的 `fromusername`（**真实发送者**，不受换号影响）做交叉校验，
-   矛盾就报警，而不是静默输出。
-
-导出普通会话实测：`sender_id → 人` 映射唯一、交叉校验零矛盾、无未判定消息。
-
-### 15. 上游节奏层会「莫名其妙等几十秒」，先看档位
-
-`rhythm` 的档位**落盘在 `~/.wechatauto/rhythm.json`、跨进程生效**。不设
-`WECHATAUTO_RHYTHM` 时用默认 `natural` 档：写动作间隔 2.5–6s、**120 秒内只允许 6 次写动作**、
-撞上限冷却 30–75s。实测因此出现过「第二条消息等了 41.95s」「`gate('send')` 等了 73.16s」
-——那是防风控层，不是代码慢。
-
-同一次连发实测：`fast` 档（写动作间隔 0.6–1.4s、120s 内 20 次）第 1 条 1.55s、第 2 条 1.67s；
-`natural` 档第 2 条 43.34s（其中 41.95s 是纯等待）。**跑实测脚本前记得设档位。**
-
-### 16. 看图：图片是「本地缓存 + 32 位 hex 指纹」，不用点开
-
-`deepseek-flash` 本身是多模态，所以难的不是调模型，是**把图拿到手**：
-
-1. 图片消息的正文是一段 XML，里面那个 **32 位 hex 就是本地 `.dat` 缓存的文件名**
-   （群消息正文还带 `wxid_xxx:` 前缀，**先剥前缀再找指纹**，否则会取错）；
-2. 一条图本机最多三档：`_h.dat` 原件 > `.dat` 微信下发那份 > `_t.dat` 预览图。
-   本程序**只读缓存、不驱动界面**（不点开图片、不把微信窗口拽到前台），
-   取「不是预览图的那一份」，一份都没有就跳过这张图；
-3. 解密后**按文件实际内容**嗅探格式（JPEG/PNG/GIF/WebP），base64 内联进请求。
-   `wxgf` 是微信动画表情的容器（内部 HEVC），不是标准图，跳过；
-4. **图片只能放在 user 消息里**——放进 system 会 400（官方限制）。官方另外限制：
-   单图 ≤32MiB、请求体 ≤48MiB、`detail: low` 会先缩到 512×512（1 张图最多算 1024 token）。
-
-踩坑：`ReplyPolicy.check()` 里那套「群里认名字 / @」的闸门会把图片消息**永久卡在
-「群里没@我」**——图片正文是 `[图片]`，既不含名字也不以问号结尾。所以图片走
-`check_image()` 单独判，并在群聊闸门处显式跳过。
-
-另一个取舍：历史上下文里的图片只留 `[发了一张图片]` 占位，**不把历史图也解密喂进去**
-（否则每张历史图都是上千 token）；只有当前这条消息的图会真的给模型看。
-
-### 17. `reasoning_effort`：这个任务用 `low` 更稳，不只是更省
-
-「思考模式」的推理和正文**抢同一个 `max_tokens`**。这个项目的提示词是**重约束型**
-（十几条规则 + 红线 + 人设 + 「一句一条」的输出格式），`reasoning_effort: high` 会让模型把
-预算大量花在「这话能不能说」上——**预算被吃光时接口返回空正文，机器人就哑了**。
-
-同一批 7 条真实消息、只换 effort 的实测：
-
-| 指标 | `low` | `high` |
-|---|---|---|
-| 非空回复 | **7/7** | **6/7**（一条被思维链吃光 → 空回复） |
-| 平均 completion tokens | **253** | 607 |
-| 平均每条成本（flash 高峰） | **0.53 分** | 0.77 分 |
-| 平均耗时 | **1.3–2.9s** | 2.7–6.1s |
-| 违反硬约束（如正文出现 `@`） | **0** | 1 |
-
-**结论：闲聊型任务 + 重约束提示词 → `low`**。这类任务要的是「读懂上文 → 挑态度 → 说一句人话」，
-不是多步推理；而哑掉比答得平庸严重得多。仓库默认 `low`，`max_tokens` 给到 1200 留足余量。
-
-> 自查脚本 `tools/measure_effort.py` 会同时统计**空回复条数**——任何「让它别说什么」的
-> 提示词改动后都该跑一次，光看回复内容好看是发现不了它哑掉的。
-
-### 18. 上下文要加时间窗：别让几小时前的旧话污染正在聊的天
-
-只按条数取「最近 N 条」有个坑：**群一安静，这 N 条能一路翻回几小时前**，
-把跟当下无关的旧消息（比如自己调试时发的测试内容）当成「正在聊的话题」喂给模型，
-模型就会顺着那些旧话接茬，说出不该说的话。
-
-`ai.history_max_age_minutes`（默认 60）只保留窗口内的消息；窗口内不足 3 条时退回最近 3 条，
-**绝不把上下文清空**（清空会让「话题轮到我」的判定失准）。副作用是好的：闲聊少的群
-上下文自然变短，**token 也省了**。设为 `0` 可回到旧行为。
-
-> 用「在 system prompt 里禁止它提某个词」来兜底是**下策**：那等于把那个词高亮给模型看，
-> 上下文里真有它，弱推理档（`reasoning_effort: low`）就会被带跑。
-> **过滤掉，比下指令可靠。**
-
-### 19. 口吻就是一段 prompt，别在代码里写死
-
-「像谁说话」完全交给 `ai.system_prompt` 里的**口吻段**（仓库里带的是一个「说书人」气质的
-语气设定：温柔、俏皮、爱用书页与星光的比喻、一句只说一两句；标题参数化成
-`【说话的口吻】`，你可以整段换成任意人设）。改口吻时**别碰**后面的安全红线与输出约束——那些是功能，不是风格。
-
-调口吻的正确姿势（都**不发送消息**）：
-
-```bat
-python tools/probe_my_voice.py      :: 先看你「自己」平时怎么打字（自动挑发言最多的会话）
-python tools\preview_replies.py     :: 改完 prompt，预览 15 条典型场景的实际回复
-```
-
-> 经验：想让机器人像某个真实的人，**用那个人自己的聊天记录当依据**比查百科、凭印象准得多
-> ——语气词、句子长短、爱用不用感叹号，这些小事骗不了人。
-> 若是虚构角色，让用户直接贴几句台词当样本，胜过任何二手转述。
+---
 
 ## 致谢
 
-- [wechatauto-replica](https://pypi.org/project/wechatauto-replica/) —— 微信 4.x 的数据库解密与 UIA 驱动，本项目站在它上面
-- [DeepSeek](https://platform.deepseek.com/) —— 默认回复模型
+- [wechatauto-replica](https://github.com/) —— 微信 4.x 自动化库
+- [DeepSeek](https://platform.deepseek.com/) —— AI API
 
-## License
+---
 
-MIT
+**最后更新：** 2026-10-25
+**维护者：** ChenQiuguo

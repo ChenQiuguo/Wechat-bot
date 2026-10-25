@@ -45,12 +45,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 REPLY_LOG = os.path.join(BASE_DIR, "bot_replies.log")
 LOCK_FILE = os.path.join(BASE_DIR, "bot.lock")
-# API Key 的查找位置（按顺序；环境变量 DEEPSEEK_API_KEY 优先级最高）
 KEY_FILE = os.path.join(BASE_DIR, "apikey.txt")
-KEY_PATHS = [
-    KEY_FILE,
-    os.path.expanduser("~/.dsh/.credentials.yaml"),   # DeepSeek Harness 的凭据文件（可选）
-]
+CRED_PATH = os.path.expanduser("~/.dsh/.credentials.yaml")
 
 # 这些跳过原因很常见，静默处理，避免刷屏
 QUIET_REASONS = {
@@ -142,28 +138,33 @@ def release_lock():
 
 
 def load_api_key() -> str:
-    """按顺序找 API Key：环境变量 → 本目录 apikey.txt → 其它凭据文件。
+    """按顺序找：环境变量 → 本目录 apikey.txt → DSH 凭据文件。
 
-    密钥只从这些位置读取，不会写进本项目任何文件。
+    密钥不写入本项目任何代码文件（apikey.txt 在 .gitignore 里，
+    build_package.py 的白名单也不带它）。
     """
     key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
     if key:
         return key
-    for path in KEY_PATHS:
-        try:
-            if not os.path.exists(path):
-                continue
-            with open(path, encoding="utf-8") as f:
-                text = f.read()
-        except Exception:
-            continue
+    # 本地/发布版一致的读取位置：源码目录下的 apikey.txt（一行一个 key，# 开头是注释）
+    try:
+        with open(KEY_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and line.startswith("sk-"):
+                    return line
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        print(f"[警告] 读取 apikey.txt 失败: {e}")
+    try:
+        with open(CRED_PATH, encoding="utf-8") as f:
+            text = f.read()
         m = re.search(r"DEEPSEEK_API_KEY:\s*[\"']?([A-Za-z0-9\-_.]+)", text)
         if m:
             return m.group(1)
-        if path == KEY_FILE:
-            first = (text.strip().splitlines() or [""])[0].strip()
-            if first.startswith("sk-"):
-                return first
+    except Exception as e:  # noqa: BLE001
+        print(f"[警告] 读取凭据文件失败: {e}")
     return ""
 
 
@@ -264,15 +265,16 @@ def _chat_call(cfg: dict, system_prompt: str, user_prompt: str, *, thinking: boo
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:  # noqa: BLE001
-        print(f"[AI 失败] {type(e).__name__}: {e}", flush=True)
+        # 调用失败 = 这条消息不会有人回。写进日志，否则无窗口启动时无从查证
+        log_line(f"[AI 失败] {type(e).__name__}: {e}")
         return ""
     msg = (data.get("choices") or [{}])[0].get("message") or {}
     out = (msg.get("content") or "").strip()
     if not out:
         reasoning = str(msg.get("reasoning_content") or "")
         if reasoning:
-            print(f"[AI 空回复] 思维链吃掉了 max_tokens（{reasoning[:40]!r}…），"
-                  f"需要显式 thinking=disabled 或调大 max_tokens", flush=True)
+            log_line(f"[AI 空回复] 思维链吃掉了 max_tokens（{reasoning[:40]!r}…），"
+                     f"需要显式 thinking=disabled 或调大 max_tokens")
     return out
 
 
@@ -769,6 +771,8 @@ class ReplyPolicy:
         self.skip_users = set(cfg.get("skip_chats", []))
         self.skip_names = set(cfg.get("skip_chat_names", []))
         self._last_reply: dict = {}
+        # (群, 发送者) → 她最近一次回这个人的时间。「接着聊」判定要用
+        self._last_reply_to: dict = {}
         self._lock = threading.Lock()
         self._recent: list = []
         self._count_today = 0
@@ -911,7 +915,18 @@ class ReplyPolicy:
                     or any(w in text for w in _ADDRESS_WORDS) \
                     or text.endswith(("?", "？"))
                 if not (cand and self._context_judge(payload, recent)):
-                    return False, "群里没@我"
+                    # ③.5「接着聊」：她刚刚还在回这个人（同群、窗口内），就别装没看见。
+                    # 「okok」这种既没 @ 也不像问句的短句，就是靠这条才接得住。
+                    # 注意这里**不 return**：放行后照样要过下面的冷却与每分钟/每日上限。
+                    win = float(self.trig.get("group_followup_seconds", 90) or 0)
+                    sk = self.sender_key(payload)
+                    followup = False
+                    if win > 0 and sk:
+                        with self._lock:
+                            last_to = self._last_reply_to.get((payload["chat_username"], sk), 0)
+                        followup = bool(last_to) and (time.time() - last_to <= win)
+                    if not followup:
+                        return False, "群里没@我"
         elif not self.trig.get("private", True):
             return False, "私聊未开启"
 
@@ -929,11 +944,19 @@ class ReplyPolicy:
                 return False, "触发每日上限"
         return True, "ok"
 
-    def mark(self, chat_username: str):
+    @staticmethod
+    def sender_key(payload: dict) -> str:
+        """群里认人优先用 wxid：群昵称一天一换，名字靠不住（见 §7.5）。"""
+        return str(payload.get("sender_wxid") or payload.get("sender") or "").strip()
+
+    def mark(self, chat_username: str, sender_key: str = ""):
         now = time.time()
         with self._lock:
             self._bump_day()
             self._last_reply[chat_username] = now
+            if sender_key:
+                # 「接着聊」用：她刚回过谁，谁再说话就接着接
+                self._last_reply_to[(chat_username, sender_key)] = now
             self._recent.append(now)
             self._count_today += 1
 
@@ -942,15 +965,83 @@ class ReplyPolicy:
 # 主流程
 # --------------------------------------------------------------------------
 
+from bot_state import BUS
+
+
 def log_line(line: str):
     print(line, flush=True)
     with open(REPLY_LOG, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+    # 顺手推给 GUI：自动识别类型
+    if line.startswith("[已发送]") or line.startswith("[发送重试]") or line.startswith("[发送放弃]") or line.startswith("[发送失败]"):
+        BUS.event("send", chat="", text=line, ok=line.startswith("[已发送]"))
+    elif "⚠" in line:
+        BUS.event("warn", text=line)
+    elif "错误" in line or "Traceback" in line or "[错误]" in line:
+        BUS.event("error", text=line)
+
+
+def relation_block(ai_cfg: dict, payload: dict) -> str:
+    """按人指定关系（`ai.relations`）：命中谁，才对谁用另一套身份认知。
+
+    默认谁都不是开拓者（提示词的记忆段这么写）；只有这里命中的那个人例外。
+    匹配键：sender_wxid / sender 昵称 / 会话名，任一命中即可。
+    没配 relations（或没命中）时返回空串，行为与以前完全一致。
+    """
+    rels = (ai_cfg or {}).get("relations") or []
+    if not rels:
+        return ""
+    keys = {str(payload.get(k) or "").strip()
+            for k in ("sender_wxid", "sender", "chat_name")}
+    keys.discard("")
+    for r in rels:
+        pats = r.get("match") or []
+        if isinstance(pats, str):
+            pats = [pats]
+        if keys & {str(p).strip() for p in pats if p}:
+            return "【关系】" + str(r.get("text") or "").strip()
+    return ""
 
 
 def _looks_like_wxid(s: str) -> bool:
     s = (s or "").strip()
     return s.startswith("wxid_") or s.startswith("gh_") or s.endswith("@chatroom")
+
+
+_ROOM_NAME_CACHE = {}  # chatroom wxid -> 群名（缓存；群里改名后重启 bot 刷新）
+
+
+def _room_display_name(db, room_wxid: str) -> str:
+    """从 contact.db 的 chat_room 表反查群名（get_nickname 只查 contact 表，
+    群 wxid 在 contact 表里通常没有行，所以群消息会解析失败、直接放弃发送）。
+    """
+    if not room_wxid or db is None:
+        return ""
+    if room_wxid in _ROOM_NAME_CACHE:
+        return _ROOM_NAME_CACHE[room_wxid]
+    name = ""
+    try:
+        # 用上游自带的 get_nickname（返回 remark or nick_name or user），
+        # 比自己手写 SQL 更稳——remark 优先，找不到才退 nick_name
+        name = (db.get_nickname(room_wxid) or "").strip()
+    except Exception:
+        name = ""
+    if name:
+        _ROOM_NAME_CACHE[room_wxid] = name
+    return name
+
+
+def _private_display_name(db, user_wxid: str, chat_name: str) -> str:
+    """私聊显示名解析：chat_name 已经是昵称就直接用；是 wxid 就反查数据库。"""
+    n = (chat_name or "").strip()
+    if n and not _looks_like_wxid(n):
+        return n
+    if db is None:
+        return ""
+    try:
+        return (db.get_nickname(user_wxid) or "").strip()
+    except Exception:
+        return ""
 
 
 def resolve_display_names(db, chat_username: str, chat_name: str) -> list:
@@ -967,22 +1058,18 @@ def resolve_display_names(db, chat_username: str, chat_name: str) -> list:
             cands.append(n)
 
     add(chat_name)
-    if cands or db is None:
+    cu = (chat_username or "").strip()
+
+    # 群聊：chat_username 是 chatroom wxid，专门反查群名
+    if cu.endswith("@chatroom"):
+        if db is not None:
+            add(_room_display_name(db, cu))
         return cands
 
-    for probe in (chat_username, chat_name):
-        probe = (probe or "").strip()
-        if not probe:
-            continue
-        try:
-            add(db.get_nickname(probe) or "")
-        except Exception:
-            pass
-        try:
-            for h in (db.search_contact(probe) or [])[:3]:
-                add(h.get("nick_name") or h.get("remark") or "")
-        except Exception:
-            pass
+    # 私聊：chat_name 已经是昵称就直接用；是 wxid 就反查
+    if db is not None:
+        add(_private_display_name(db, cu, chat_name))
+
     return cands
 
 
@@ -1159,17 +1246,83 @@ def _resp_ok(resp) -> bool:
     return ok
 
 
+def _sent_watermark(db, chat_username: str) -> tuple:
+    """发送前拍落库水位：会话最后一条的 (sort_seq, local_id)。
+
+    没有水位就不能判断「这条是不是刚发的」——同一段话昨天发过、库里还留着，
+    拿它当证据会把「其实没发出去」误判成成功（§7 坑 4 的正解）。
+    """
+    if db is None:
+        return None
+    try:
+        rows = db.get_messages(chat_username, limit=5)
+    except Exception:  # noqa: BLE001
+        return None
+    seqs = [int(r.get("sort_seq") or 0) for r in rows]
+    if not seqs:
+        return None
+    return {"seq": max(seqs),
+            "ids": {(int(r.get("sort_seq") or 0), int(r.get("local_id") or 0))
+                    for r in rows}}
+
+
+def _confirmed_sent(db, chat_username: str, text: str, mark, self_id,
+                    tries: int = 3, wait: float = 1.5) -> bool:
+    """回读数据库确认这条真的发出去了。
+
+    只认**比水位新**的行，且正文逐字相等。微信落库有延迟，所以轮询几次；
+    都查不到就返回 False（宁可当成没发出去，交给上层重发——有水位门槛，
+    不会把旧消息当成这次发出去的）。
+    """
+    if db is None or not text:
+        return False
+    for i in range(tries):
+        try:
+            rows = db.get_messages(chat_username, limit=8)
+        except Exception:  # noqa: BLE001
+            return False
+        for m in rows:
+            seq = int(m.get("sort_seq") or 0)
+            if mark:
+                if seq < mark["seq"]:
+                    continue
+                if (seq, int(m.get("local_id") or 0)) in mark["ids"]:
+                    continue
+            if self_id and int(m.get("sender_id") or 0) != self_id:
+                continue
+            content = (m.get("content") or "")
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="replace")
+            if str(content).strip() == text.strip():
+                return True
+        if i + 1 < tries:
+            time.sleep(wait)
+    return False
+
+
+def _short(resp, limit: int = 60) -> str:
+    """日志里 resp 太长会把行撑爆（整个 resp 字典）。"""
+    s = str(resp).replace("\n", " ")
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
 def send_multi_impl(get_gui, send_lock, db, texts, chat_username, chat_name,
-                    gap: float = 1.0) -> tuple:
+                    gap: float = 1.0, verify: bool = True,
+                    self_id=None) -> tuple:
     """把若干条消息依次发给同一会话：只打开一次会话，之后连发。
 
     返回 (是否全部发出, 已发出的条数)。
+
+    ``verify=True``（默认）时每条发完回读数据库确认。**这不是多余的**：
+    UI 路径只看「回车有没有按下去」，不看消息有没有真发出去——焦点丢了
+    会静默只填不发，而上层一旦重试就会把已发出去的那句**再发一遍**（§7.20）。
     """
     texts = [t for t in (texts or []) if (t or "").strip()]
     if not texts:
         return True, 0
     with send_lock:
         t0 = time.time()
+        sent = 0
         try:
             gui = get_gui()
             names = resolve_display_names(db, chat_username, chat_name)
@@ -1178,30 +1331,69 @@ def send_multi_impl(get_gui, send_lock, db, texts, chat_username, chat_name,
                 opened, why = open_chat_via_session_list(gui, n)
                 if opened:
                     break
+            if not opened and not names:
+                # 昵称解析不出来（如私聊只拿到 wxid）：连搜索框这条路都走不通，
+                # 上游会白等 75s×3 次。提前放弃，把原因写清楚（§7.20）。
+                log_line(f"[发送放弃] {chat_name}: 解析不出显示名（只有 "
+                         f"{chat_username}），无法定位会话，跳过发送")
+                return False, 0
             who = names[0] if names else (chat_name or chat_username)
             if opened:
                 via = "列表点击"
             else:
                 via = f"搜索回退[{why}]"
-            sent = 0
+
+            def _inject(text: str) -> tuple:
+                """注入一条 → (是否成功, resp 或错误文本)。异常在这里就地吞掉，交给重试。"""
+                try:
+                    resp = gui.send_msg(text, None if opened else who, False)
+                    return _resp_ok(resp), resp
+                except Exception as e:  # noqa: BLE001
+                    return False, f"{type(e).__name__}: {e}"
+
             for i, text in enumerate(texts):
                 if not (opened or i == 0):
                     break        # 会话没打开成功，只有第一条能靠搜索框补
-                resp = gui.send_msg(text, None if opened else who, False)
-                ok = _resp_ok(resp)
-                sent += 1 if ok else 0
+                # 水位必须在任何 UI 动作**之前**拍：一旦发出去，库里已经有新行了
+                mark = _sent_watermark(db, chat_username) if verify else None
+                ok, resp = _inject(text)
+                # UI 说成功不等于真发出去：回读确认，认不出来的当没发出去
+                if ok and verify:
+                    if not _confirmed_sent(db, chat_username, text, mark, self_id):
+                        ok, resp = False, f"回读未确认（{_short(resp)}）"
+                        log_line(f"[未确认] {chat_name}: 第{i + 1}/{len(texts)}条 UI 报成功，"
+                                 f"但库里查不到，按未发出处理")
+                if not ok:
+                    # 失败重试一次：重开会话把焦点交回输入框（UIA，不碰剪贴板）。
+                    # 有水位门槛兜底，重发不会变成「同一句发两遍」。
+                    log_line(f"[发送重试] {chat_name}: 第{i + 1}/{len(texts)}条失败（{_short(resp)}），"
+                             f"重开会话再试一次")
+                    reopened = False
+                    for n in names:
+                        reopened, _ = open_chat_via_session_list(gui, n)
+                        if reopened:
+                            break
+                    if reopened or opened:
+                        time.sleep(0.4)
+                        ok, resp = _inject(text)
+                        if ok and verify and not _confirmed_sent(
+                                db, chat_username, text, mark, self_id):
+                            ok, resp = False, f"重试后仍未确认（{_short(resp)}）"
                 log_line(f"{'[已发送]' if ok else '[发送异常]'} → {chat_name}: {text} "
                          f"| {via}{'' if len(texts) == 1 else f' 第{i + 1}/{len(texts)}条'} "
-                         f"{time.time() - t0:.1f}s | resp={resp}")
+                         f"{time.time() - t0:.1f}s | resp={_short(resp)}")
                 if not ok:
+                    log_line(f"[放弃] {chat_name}: 第{i + 1}/{len(texts)}条重试后仍失败，"
+                             f"剩下的不发了（已发出 {sent} 条）")
                     return False, sent
+                sent += 1
                 if i + 1 < len(texts):
                     # 连发之间留点间隔，别撞上游库的节奏闸
                     time.sleep(max(0.0, gap))
             return True, sent
         except Exception as e:  # noqa: BLE001
-            log_line(f"[发送失败] {chat_name}: {type(e).__name__}: {e}")
-            return False, 0
+            log_line(f"[发送失败] {chat_name}: {type(e).__name__}: {e}（已发出 {sent} 条）")
+            return False, sent
 
 
 def do_send_impl(args, get_gui, send_lock, db, text, chat_username, chat_name):
@@ -1404,6 +1596,10 @@ def main():
     # 发送端：只初始化一次，避免每次发送都重新校准布局
     sender = {"gui": None}
     send_lock = threading.Lock()
+    # 发送后是否回读数据库确认（§7.20）。关掉会退回「UI 报成功就算成功」，
+    # 那样只输入不发送和重复发送都会回来。想临时关掉排查就设 false。
+    send_verify = bool((cfg.get("send") or {}).get("verify", True))
+    log_line(f"[发送确认] 回读数据库：{'开' if send_verify else '关'}")
 
     def get_gui():
         if sender["gui"] is None:
@@ -1425,7 +1621,8 @@ def main():
             for t in texts:
                 log_line(f"[DRY-RUN] 本应发送「{chat_name}」: {t}")
             return True, len(texts)
-        return send_multi_impl(get_gui, send_lock, db, texts, chat_username, chat_name)
+        return send_multi_impl(get_gui, send_lock, db, texts, chat_username, chat_name,
+                               verify=send_verify, self_id=resolver.self_id)
 
     # --test-reply：模拟一条私信
     if args.test_reply:
@@ -1446,6 +1643,17 @@ def main():
     print(f"账号：{info.get('nick_name')} ({info.get('username')})")
     print(f"自身 sender_id：{lock_self_id}"
           f"{'（⚠ filehelper 里出现多个 id，自身判定可能不准）' if extra_ids else ''}")
+    log_line(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动 | 账号={info.get('nick_name')} "
+             f"({info.get('username')}) self_id={lock_self_id} rhythm={cfg.get('rhythm')} "
+             f"私聊={cfg['trigger']['private']} 群@={cfg['trigger']['group_at']}")
+    BUS.set_status(
+        online=True, running=True,
+        account=info.get("nick_name") or "", account_wxid=info.get("username") or "",
+        self_id=lock_self_id, rhythm=str(cfg.get("rhythm", "")),
+        dry_run=bool(args.dry_run), started_at=time.time(),
+        reply_count_today=0,
+    )
+    BUS.event("system", text=f"启动完成 · 账号={info.get('nick_name')} 节奏={cfg.get('rhythm')}")
     if extra_ids:
         print("  ⚠ 建议退出重登微信、或跑 check_account.py 复核，否则可能回复自己")
     try:                                    # 多账号时把另一个号也报出来，便于确认没挑错
@@ -1488,8 +1696,10 @@ def main():
     lst = Listener(db, interval=1.0)
 
     def build_mem_block(payload: dict) -> str:
-        """记忆档案 + 本群成员名单（两块都注入，避免认错人/编名字）。"""
-        block = ""
+        """关系说明 + 记忆档案 + 本群成员名单（都注入，避免认错人/编名字）。"""
+        block = relation_block(cfg["ai"], payload)
+        if block:
+            print(f"  · 已注入「{payload['chat_name']}」的关系说明", flush=True)
         if cfg["ai"].get("memory", {}).get("enabled", True):
             try:
                 block = memory_store.prompt_block(memory_store.load(payload["chat_username"]))
@@ -1533,9 +1743,23 @@ def main():
         return item
 
     def on_msg(msg: dict, _lst: Listener):
+        # 整个回调包 try/except：任何未预期异常都不能抛给 Listener，
+        # 否则上游会重试 3 次（同一条消息触发 4 次回调）并最终丢弃该消息、
+        # 推进水位 —— 表现为「同一条消息被记 4 次」+「后续私聊消息全收不到」（§7.22.2）
+        try:
+            _on_msg_inner(msg, _lst)
+        except Exception as e:  # noqa: BLE001
+            log_line(f"[回调异常] {type(e).__name__}: {e}（msg.local_id={msg.get('local_id')}）")
+            import traceback
+            traceback.print_exc()
+
+    def _on_msg_inner(msg: dict, _lst: Listener):
         payload = build_payload(db, resolver, msg)
         if not payload["is_self"]:
             policy._last_incoming[payload["chat_username"]] = time.time()
+            BUS.event("recv", chat=payload["chat_name"], sender=payload["sender"],
+                      text=(payload["content"] or "")[:80])
+            BUS.set_status(last_msg_time=time.time())
         # 图片消息：先取图（policy.check 要用它判断该不该回，生成回复时直接复用）
         local_id = msg.get("local_id")
         policy.pending_image = None
@@ -1561,7 +1785,10 @@ def main():
                 extra = "" if ureason in ("不是在问问题", "主动接话未开启", "私聊不主动") \
                     else " / 主动接话：" + ureason
                 if reason not in QUIET_REASONS and not reason.startswith("非文本"):
-                    print(f"  · 跳过 {payload['chat_name']} | {reason}{extra}", flush=True)
+                    # 写进日志：这些正是「该回却没回」的原因（冷却/上限/消息过旧/群里判定为否）
+                    log_line(f"[{payload['time']}] 未回 {payload['chat_name']} | "
+                             f"{payload['sender']}: {(payload['content'] or '')[:40]} "
+                             f"| 原因：{reason}{extra}")
                 return
             unsolicited = True
             log_line(f"[{payload['time']}] 主动接话 {payload['chat_name']} | "
@@ -1586,10 +1813,11 @@ def main():
             return
         # 一句一条发（模式见 ai.multi_send）；想整段一条就把 enabled 关掉
         texts = split_for_send(reply, ms)
-        policy.mark(payload["chat_username"])
+        policy.mark(payload["chat_username"], policy.sender_key(payload))
         if unsolicited:
             uns.mark(payload["chat_username"])
         if send_multi(texts, payload["chat_username"], payload["chat_name"])[0]:
+            BUS.set_status(reply_count_today=BUS.status().get("reply_count_today", 0) + len(texts))
             # 异步更新记忆档案（不阻塞、不影响回复延迟）
             if cfg["ai"].get("memory", {}).get("enabled", True):
                 lines = list(history or [])
@@ -1615,16 +1843,26 @@ def main():
                 last_check = time.time()
                 state = account_guard(db, lock_wxid)
                 if state == "switched":
+                    BUS.set_status(online=False, running=False)
+                    BUS.event("warn", text="检测到微信账号已变化，机器人已停止")
                     log_line(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ⚠ 检测到微信登录账号已变化"
                              f"（启动时 {lock_nick}/{lock_wxid}）→ 立刻停止，避免认错人、回复自己")
                     print("\n[!] 登录账号变了，机器人已退出。请重新双击 restart_bot.bat 启动。")
                     break
                 if state == "unknown":
-                    print("  · 账号状态读不到（微信可能已退出登录），继续观察", flush=True)
+                    BUS.set_status(online=False)
+                    BUS.event("warn", text="微信账号状态读不到，可能已退出登录")
+                    # 微信可能掉线了 —— 这期间她一条都不会回，必须留痕
+                    log_line(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ⚠ 账号状态读不到"
+                             f"（微信可能已退出登录或窗口异常），继续观察")
+                else:
+                    BUS.set_status(online=True)
     except KeyboardInterrupt:
         pass
     finally:
         lst.stop()
+        BUS.set_status(running=False)
+        BUS.event("system", text="机器人已停止")
         print("\n已停止。")
     return 0
 
