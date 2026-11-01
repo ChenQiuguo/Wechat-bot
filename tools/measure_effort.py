@@ -41,11 +41,12 @@ def call(effort: str, history, content, sender, chat_name, is_group, me):
     ctx = ("最近的聊天记录（最后一条就是刚收到的）：\n" + "\n".join(history) + "\n\n"
            if history else "")
     prompt = ident + ctx + f"{who} 刚发来：{content}"
+    is_mimo = (CFG.get("provider") or "").lower() == "mimo"
     body = {
         "model": CFG["model"],
         "messages": [{"role": "system", "content": CFG["system_prompt"]},
                      {"role": "user", "content": prompt}],
-        "max_tokens": CFG.get("max_tokens", 1200),
+        ("max_completion_tokens" if is_mimo else "max_tokens"): CFG.get("max_tokens", 1200),
         "stream": False,
         "thinking": {"type": "enabled"},
         "reasoning_effort": effort,

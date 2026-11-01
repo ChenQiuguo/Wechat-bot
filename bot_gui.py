@@ -32,33 +32,33 @@ LOG_PATH = os.path.join(BASE_DIR, "bot_replies.log")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 LOCK_PATH = os.path.join(BASE_DIR, "bot.lock")
 
-# ---- 配色（主题：纯洁白基底 + 柔粉 + 冰晶蓝绿，无黑色圣洁梦幻风）----
-BG = "#FDF6F0"          # 珍珠白（页面基底，60%+ 占比）
-BG2 = "#FDE8E4"         # 暖调肤色白（卡片/工具栏，带暖意的白）
-FG = "#8B6B72"          # 粉棕色文字（避免黑色，柔和可读）
-FG_DIM = "#C4A5AA"      # 浅粉灰（次要信息）
-ACCENT = "#F8A4B8"      # 主题粉（主视觉：主按钮/标题/高亮，柔和樱粉）
-OK = "#7EC8C8"          # 冰晶蓝绿（在线/成功，清澈灵气）
-WARN = "#F8C8D4"        # 浅樱粉（警告）
-ERR = "#E8A0A8"         # 柔粉红（错误/停止，避免刺眼深红）
-RECV_BG = "#FEF0F2"     # 极浅樱粉（接收消息背景）
-SEND_BG = "#E8F4F8"     # 极浅冰晶蓝（发送消息背景，冷暖对比）
-SYS_BG = "#F8F4F0"      # 暖白（系统消息背景）
+# ---- 配色（整体粉色调：粉白基底 + 樱粉强调 + 亮粉点缀，参考用户给的 #F77EA9）----
+BG = "#FFFAFC"          # 粉白（页面基底，60%+ 占比）
+BG2 = "#FDE8EF"         # 浅樱粉（卡片/工具栏/状态栏）
+FG = "#8A5A6B"          # 粉棕文字（粉底上柔和可读）
+FG_DIM = "#D4A5B5"      # 浅粉灰（次要信息）
+ACCENT = "#F77EA9"      # 亮粉（主视觉：主按钮/标题/高亮，用户指定）
+OK = "#E88AAE"          # 樱粉（在线/成功）
+WARN = "#F9C6D8"        # 浅樱粉（警告）
+ERR = "#E0527F"         # 深亮粉（错误/停止，避免刺眼）
+RECV_BG = "#FFE4EF"     # 淡粉（接收消息背景，浅化 #FFC0D9）
+SEND_BG = "#D6EDF8"     # 淡蓝（发送消息背景，浅化 #85C6EB）
+SYS_BG = "#FFF5F8"      # 粉白（系统消息背景）
 
-# 主题彩虹色（粉 + 蓝绿 + 粉紫，梦幻层次）
+# 主题彩虹色（亮粉 + 樱粉 + 浅粉，粉色层次）
 CHAT_COLORS = [
-    "#F8A4B8",  # 主题粉（主视觉）
-    "#7EC8C8",  # 冰晶蓝绿
-    "#D4A5D8",  # 粉紫色（梦幻辅助）
-    "#F8C8D4",  # 浅樱粉
-    "#A5D8E8",  # 淡冰蓝
-    "#E8B4D8",  # 浅粉紫
-    "#F8A4B8"   # 主题粉
+    "#F77EA9",  # 亮粉（主视觉，用户指定）
+    "#E88AAE",  # 樱粉
+    "#F9C6D8",  # 浅樱粉
+    "#F4A7C0",  # 中粉
+    "#FADCE7",  # 极浅粉
+    "#D4738F",  # 深粉
+    "#F77EA9"   # 亮粉
 ]
 
 # ♪ + ♡ 装饰符号颜色
-NOTE_COLOR = "#F8A4B8"
-HEART_COLOR = "#F8C8D4"
+NOTE_COLOR = "#F77EA9"
+HEART_COLOR = "#E88AAE"
 
 
 class BotGUI:
@@ -87,9 +87,9 @@ class BotGUI:
 
     # ------------------------------------------------------------------ UI 构建
     def _setup_window(self):
-        self.root.title("♪ 微信 AI 机器人 ♡")
-        self.root.geometry("1100x680")  # 再次放大窗口容纳大字号
-        self.root.minsize(900, 560)
+        self.root.title("♪ 你的昵称 ♡")
+        self.root.geometry("1320x820")  # 再次放大窗口容纳大字号
+        self.root.minsize(1040, 660)
         self.root.configure(bg=BG)
         try:
             self.root.iconbitmap(default="")
@@ -105,18 +105,18 @@ class BotGUI:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_status_bar(self):
-        bar = tk.Frame(self.root, bg=BG2, height=64)  # 加高以容纳大字号
+        bar = tk.Frame(self.root, bg=BG2, height=74)  # 加高以容纳大字号
         bar.pack(fill=tk.X, side=tk.TOP)
         bar.pack_propagate(False)
 
         def _badge(parent, label):
             f = tk.Frame(parent, bg=BG2)
-            f.pack(side=tk.LEFT, padx=14, pady=12)
-            tk.Label(f, text=label, bg=BG2, fg=FG_DIM, font=("Microsoft YaHei UI", 12)).pack(side=tk.LEFT)
-            dot = tk.Canvas(f, width=14, height=14, bg=BG2, highlightthickness=0)  # 加大圆点
+            f.pack(side=tk.LEFT, padx=14, pady=14)
+            tk.Label(f, text=label, bg=BG2, fg=FG_DIM, font=("Microsoft YaHei UI", 14)).pack(side=tk.LEFT)
+            dot = tk.Canvas(f, width=15, height=15, bg=BG2, highlightthickness=0)  # 加大圆点
             dot.pack(side=tk.LEFT, padx=(5, 0))
-            oval = dot.create_oval(1, 1, 13, 13, fill=ERR, outline="")
-            val = tk.Label(f, text="—", bg=BG2, fg=FG, font=("Microsoft YaHei UI", 12, "bold"))
+            oval = dot.create_oval(1, 1, 14, 14, fill=ERR, outline="")
+            val = tk.Label(f, text="—", bg=BG2, fg=FG, font=("Microsoft YaHei UI", 14, "bold"))
             val.pack(side=tk.LEFT, padx=(7, 0))
             return dot, oval, val
 
@@ -130,26 +130,26 @@ class BotGUI:
         self._val_last = self._badge_label(bar, "最后消息")
 
         # 右侧：♪ + ♡ 装饰符号（加大更清晰）
-        tk.Label(bar, text="♪", bg=BG2, fg=NOTE_COLOR, font=("Microsoft YaHei UI", 24, "bold")).pack(side=tk.RIGHT, padx=18)
-        tk.Label(bar, text="♡", bg=BG2, fg=HEART_COLOR, font=("Microsoft YaHei UI", 22)).pack(side=tk.RIGHT, padx=(0, 8))
+        tk.Label(bar, text="♪", bg=BG2, fg=NOTE_COLOR, font=("Microsoft YaHei UI", 26, "bold")).pack(side=tk.RIGHT, padx=18)
+        tk.Label(bar, text="♡", bg=BG2, fg=HEART_COLOR, font=("Microsoft YaHei UI", 24)).pack(side=tk.RIGHT, padx=(0, 8))
 
     def _badge_label(self, parent, label):
         f = tk.Frame(parent, bg=BG2)
-        f.pack(side=tk.LEFT, padx=14, pady=12)
-        tk.Label(f, text=label, bg=BG2, fg=FG_DIM, font=("Microsoft YaHei UI", 12)).pack(side=tk.LEFT)
-        val = tk.Label(f, text="—", bg=BG2, fg=FG, font=("Microsoft YaHei UI", 12, "bold"))
+        f.pack(side=tk.LEFT, padx=14, pady=14)
+        tk.Label(f, text=label, bg=BG2, fg=FG_DIM, font=("Microsoft YaHei UI", 14)).pack(side=tk.LEFT)
+        val = tk.Label(f, text="—", bg=BG2, fg=FG, font=("Microsoft YaHei UI", 14, "bold"))
         val.pack(side=tk.LEFT, padx=(7, 0))
         return val
 
     def _build_chat_area(self):
         frame = tk.LabelFrame(self.root, text="  ♪ 对话流 ♡  ", bg=BG, fg=ACCENT,
-                              font=("Microsoft YaHei UI", 13, "bold"), bd=0, relief=tk.FLAT)
+                              font=("Microsoft YaHei UI", 15, "bold"), bd=0, relief=tk.FLAT)
         frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(10, 4))
 
-        self._chat_text = tk.Text(frame, bg=BG, fg=FG, font=("Microsoft YaHei UI", 13),  # 大字号
-                                  wrap=tk.WORD, bd=0, padx=12, pady=10,
+        self._chat_text = tk.Text(frame, bg=BG, fg=FG, font=("Microsoft YaHei UI", 16),  # 大字号
+                                  wrap=tk.WORD, bd=0, padx=14, pady=12,
                                   state=tk.DISABLED, insertbackground=ACCENT,
-                                  selectbackground="#F8C8D4", selectforeground=FG)
+                                  selectbackground="#F9C6D8", selectforeground=FG)
         scrollbar = ttk.Scrollbar(frame, command=self._chat_text.yview)
         self._chat_text.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -161,56 +161,61 @@ class BotGUI:
         self._chat_text.tag_configure("send", foreground=FG, background=SEND_BG, justify=tk.RIGHT,
                                       lmargin1=18, lmargin2=18,
                                       spacing1=5, spacing3=5, relief=tk.FLAT, borderwidth=2)
-        self._chat_text.tag_configure("sys", foreground=FG_DIM, background=SYS_BG, font=("Microsoft YaHei UI", 12),
+        self._chat_text.tag_configure("sys", foreground=FG_DIM, background=SYS_BG, font=("Microsoft YaHei UI", 14),
                                       lmargin1=18, lmargin2=18,
                                       spacing1=5, spacing3=5)
         self._chat_text.tag_configure("err", foreground=ERR, lmargin1=18, lmargin2=18,
                                       spacing1=5, spacing3=5)
         self._chat_text.tag_configure("chat_header", foreground=ACCENT,
-                                      font=("Microsoft YaHei UI", 12, "italic"),
+                                      font=("Microsoft YaHei UI", 14, "italic"),
                                       lmargin1=18, lmargin2=18, spacing1=7)
+        # 思考过程（模型思维链）：斜体浅色、缩进、独立浅背景，和正常消息区分开
+        self._chat_text.tag_configure("think", foreground=FG_DIM, background="#FFF5F8",
+                                      font=("Microsoft YaHei UI", 15, "italic"),
+                                      lmargin1=34, lmargin2=34,
+                                      spacing1=4, spacing3=4)
 
     def _build_log_area(self):
         frame = tk.LabelFrame(self.root, text="  系统日志  ", bg=BG, fg=FG_DIM,
-                              font=("Microsoft YaHei UI", 12), bd=0, relief=tk.FLAT, height=170)
+                              font=("Microsoft YaHei UI", 14), bd=0, relief=tk.FLAT, height=180)
         frame.pack(fill=tk.X, padx=12, pady=(4, 10))
         frame.pack_propagate(False)
 
-        self._log_text = tk.Text(frame, bg="#FEFBF8", fg=FG_DIM, font=("Consolas", 12),  # 大字号
+        self._log_text = tk.Text(frame, bg="#FFF5F8", fg=FG_DIM, font=("Consolas", 14),  # 大字号
                                  wrap=tk.WORD, bd=0, padx=10, pady=8,
                                  state=tk.DISABLED, height=6)
         scrollbar = ttk.Scrollbar(frame, command=self._log_text.yview)
         self._log_text.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self._log_text.pack(fill=tk.BOTH, expand=True)
-        self._log_text.tag_configure("ok", foreground="#5BA8A8")  # 冰晶蓝绿（成功）
-        self._log_text.tag_configure("warn", foreground="#D4A0B0")  # 柔粉（警告）
-        self._log_text.tag_configure("err", foreground="#C87080")  # 深樱粉（错误，避免刺眼）
+        self._log_text.tag_configure("ok", foreground="#D4738F")  # 深粉（成功）
+        self._log_text.tag_configure("warn", foreground="#D4A5B5")  # 浅粉灰（警告）
+        self._log_text.tag_configure("err", foreground="#E0527F")  # 深亮粉（错误，避免刺眼）
         self._log_text.tag_configure("info", foreground=FG_DIM)
 
     def _build_toolbar(self):
-        bar = tk.Frame(self.root, bg=BG2, height=62)  # 加高以容纳大字号
+        bar = tk.Frame(self.root, bg=BG2, height=70)  # 加高以容纳大字号
         bar.pack(fill=tk.X, side=tk.TOP)  # ← TOP
         bar.pack_propagate(False)
 
         def _btn(text, cmd, color=ACCENT):
             b = tk.Button(bar, text=text, command=cmd, bg=BG, fg=color,
-                          activebackground="#FEF0F2", activeforeground=FG,
-                          font=("Microsoft YaHei UI", 12, "bold"), bd=0, padx=22, pady=10,  # 大字号大按钮
+                          activebackground="#FDE8EF", activeforeground=FG,
+                          font=("Microsoft YaHei UI", 14, "bold"), bd=0, padx=24, pady=11,  # 大字号大按钮
                           cursor="hand2", relief=tk.FLAT)
-            b.pack(side=tk.LEFT, padx=(12, 6), pady=10)
+            b.pack(side=tk.LEFT, padx=(12, 6), pady=11)
             return b
 
-        _btn("▶ 启动", self.start_bot, "#5BA8A8")  # 冰晶蓝绿（启动/在线）
-        _btn("⏹ 停止", self.stop_bot, "#C87080")   # 深樱粉（停止/错误）
-        _btn("↻ 重启", self.restart_bot, "#D4A0B0") # 柔粉（重启/警告）
+        _btn("▶ 启动", self.start_bot, "#D4738F")  # 深粉（启动/在线）
+        _btn("⏹ 停止", self.stop_bot, "#E0527F")   # 深亮粉（停止/错误）
+        _btn("↻ 重启", self.restart_bot, "#D4A5B5") # 浅粉灰（重启/警告）
         _btn("📂 打开日志", lambda: self._open_file(LOG_PATH), FG_DIM)
         _btn("⚙ 配置", lambda: self._open_file(CONFIG_PATH), FG_DIM)
         _btn("🗑 清空对话", self._clear_chat, FG_DIM)
 
         # 状态栏右侧：机器人 PID
         self._val_pid = tk.Label(bar, text="", bg=BG2, fg=FG_DIM,
-                                 font=("Consolas", 12))
+                                 font=("Consolas", 14))
         self._val_pid.pack(side=tk.RIGHT, padx=18)
 
     # ------------------------------------------------------------------ 机器人控制
@@ -236,14 +241,20 @@ class BotGUI:
             self._log("机器人已在运行，无需重复启动", "warn")
             return
         try:
+            # 走 start_bot.bat 启动，继承它的"微信在线检查 + 依赖自检自愈"，
+            # 否则依赖丢失时 wx_bot.py 会静默死掉（今天就栽在这）。
+            bat = os.path.join(BASE_DIR, "start_bot.bat")
+            env = dict(os.environ)
+            env["NO_PAUSE"] = "1"  # 后台启动：出错也不 pause 卡住隐藏窗口
             self.bot_proc = subprocess.Popen(
-                [PY, "-u", BOT_SCRIPT],
+                ["cmd", "/c", bat],
                 cwd=BASE_DIR,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                env=env,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
-            self._log("机器人已启动", "ok")
+            self._log("机器人启动中（自检微信 + 依赖）…", "ok")
             threading.Thread(target=self._pump_bot_output, daemon=True).start()
         except Exception as e:
             self._log(f"启动失败：{e}", "err")
@@ -376,6 +387,11 @@ class BotGUI:
                 tag = "send" if ev.get("ok") else "err"
                 prefix = "" if ev.get("ok") else "[失败] "
                 self._append_chat(tag, f"{prefix}{ev.get('chat', '?')} ← {ev.get('text', '')}")
+            elif kind == "thinking":
+                # 模型思维链：多行文本整体缩进展示（不加时间戳前缀，保持思考原文完整）
+                text = (ev.get("text") or "").strip()
+                if text:
+                    self._append_think(f"{ev.get('chat', '?')} · {ev.get('sender', '?')} 思考中…", text)
             elif kind == "system":
                 self._append_chat("sys", ev.get("text", ""))
             elif kind == "warn":
@@ -401,6 +417,25 @@ class BotGUI:
         at_bottom = self._chat_text.yview()[1] >= 0.99
         line = f"[{ts}] {text}\n"
         self._chat_text.insert(tk.END, line, tag)
+        # 截断
+        max_lines = 2000
+        line_count = int(self._chat_text.index("end-1c").split(".")[0])
+        if line_count > max_lines:
+            self._chat_text.delete("1.0", f"{line_count - max_lines}.0")
+        if at_bottom:
+            self._chat_text.see(tk.END)
+        self._chat_text.config(state=tk.DISABLED)
+
+    def _append_think(self, header: str, body: str):
+        """把模型的思维链（多行）以斜体缩进块渲染到对话流。"""
+        ts = time.strftime("%H:%M:%S")
+        self._chat_text.config(state=tk.NORMAL)
+        at_bottom = self._chat_text.yview()[1] >= 0.99
+        # 思维链可能很长，截断到合理长度避免刷屏（完整内容在 bot_replies.log 里没有，这里就地保留前 1200 字）
+        if len(body) > 1200:
+            body = body[:1200] + " ……（已截断）"
+        block = f"[{ts}] ◈ {header}\n{body}\n"
+        self._chat_text.insert(tk.END, block, "think")
         # 截断
         max_lines = 2000
         line_count = int(self._chat_text.index("end-1c").split(".")[0])

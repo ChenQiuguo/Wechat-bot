@@ -40,13 +40,14 @@ prompt = (f"你的微信昵称是「你的昵称」，你就是本人，用第�
           f"最近的聊天记录（最后一条就是刚收到的）：\n" + "\n".join(HISTORY) +
           f"\n\n小明 刚发来：{CONTENT}")
 
+is_mimo = (cfg.get("provider") or "").lower() == "mimo"
 body = {
     "model": cfg["model"],
     "messages": [
         {"role": "system", "content": cfg["system_prompt"]},
         {"role": "user", "content": prompt},
     ],
-    "max_tokens": cfg.get("max_tokens", 400),
+    ("max_completion_tokens" if is_mimo else "max_tokens"): cfg.get("max_tokens", 400),
     "stream": False,
 }
 if cfg.get("thinking", False):

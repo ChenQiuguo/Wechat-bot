@@ -81,10 +81,12 @@ def prompt_block(mem: dict) -> str:
 
 
 def _chat(cfg_ai: dict, messages: list, key: str, max_tokens: int = 400) -> str:
+    # DeepSeek 用 max_tokens；MiMo（OpenAI 兼容）用 max_completion_tokens
+    is_mimo = (cfg_ai.get("provider") or "").lower() == "mimo"
     body = {
         "model": cfg_ai.get("model", "deepseek-flash"),
         "messages": messages,
-        "max_tokens": max_tokens,
+        ("max_completion_tokens" if is_mimo else "max_tokens"): max_tokens,
         "temperature": 0.3,
         "stream": False,
         "thinking": {"type": "disabled"},   # 抽取信息不需要思考，省钱省时间

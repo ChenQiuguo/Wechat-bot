@@ -220,12 +220,15 @@ def build_history(db: WeChatDB, resolver: "SenderResolver", chat_username: str,
 def _chat_call(cfg: dict, system_prompt: str, user_prompt: str, *, thinking: bool,
                max_tokens: int, timeout: float, temperature: float = 1.2,
                reasoning_effort: str = "high", api_key: str = "",
-               images=None) -> str:
+               images=None, chat_meta: dict = None) -> str:
     """调一次 chat/completions，返回正文（失败返回空串）。
 
     ``images`` 非空时走视觉输入：user 消息的 content 变成内容块数组，
     图片按 base64 data URL 内联（官方限制：单图 ≤32MiB、请求体 ≤48MiB，
     **图片只能放在 user 消息里**，system 里带图会 400）。
+
+    ``chat_meta``（可选）：{"chat": 会话名, "sender": 发送者} —— 有它时，
+    模型返回的思维链（reasoning_content）会作为 "thinking" 事件推给 GUI 界面展示。
     """
     key = api_key or load_api_key()
     if not key:
@@ -243,18 +246,37 @@ def _chat_call(cfg: dict, system_prompt: str, user_prompt: str, *, thinking: boo
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        "max_tokens": max_tokens,
+        # DeepSeek 用 max_tokens；MiMo（OpenAI 兼容）用 max_completion_tokens，
+        # 两者语义相同（思考+正文总长），按 provider 二选一发送，另一个不传。
+        ("max_completion_tokens" if (cfg.get("provider") or "").lower() == "mimo" else "max_tokens"): max_tokens,
         "stream": False,
     }
     if thinking:
-        # 思考模式：先出思维链再出答案；注意该模式下 temperature 会被忽略
+        # 思考模式：先出思维链再出答案
         body["thinking"] = {"type": "enabled"}
+        # reasoning_effort：DeepSeek 走顶层参数；MiMo 官方 OpenAI 兼容文档没列它，
+        # 但实测 chat 端点收（2026-10-25 实测 401/400 都没有，返回正常），
+        # 且配置里 reasoning_effort=low 表示用户要求「推理等级用 low」，所以两家都发。
         body["reasoning_effort"] = reasoning_effort
     else:
-        # 必须显式 disabled：deepseek-flash 不传 thinking 时默认自己开思考，
+        # 必须显式 disabled：deepseek-flash / mimo-v2.6-* 不传 thinking 时默认自己开思考，
         # 思维链会把 max_tokens 吃光、content 返回空串（二选一的判定会静默全错）。
         body["thinking"] = {"type": "disabled"}
         body["temperature"] = temperature
+
+    # 联网搜索（MiMo web_search 工具）：只在 provider=mimo 且配置开启时挂上。
+    # 由模型自己判断要不要搜（force_search=false），搜到的内容会以 annotations 返回，
+    # 正文里模型会自己引用。判定类调用（judge）不挂——它们只要一个字，不需要联网。
+    ws = cfg.get("web_search") or {}
+    if ws.get("enabled") and (cfg.get("provider") or "").lower() == "mimo":
+        body["tools"] = [{
+            "type": "web_search",
+            "max_keyword": int(ws.get("max_keyword", 3)),
+            "force_search": bool(ws.get("force_search", False)),
+            "limit": int(ws.get("limit", 3)),
+        }]
+        body["tool_choice"] = "auto"
+
     req = urllib.request.Request(
         cfg["base_url"].rstrip("/") + "/chat/completions",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -270,8 +292,18 @@ def _chat_call(cfg: dict, system_prompt: str, user_prompt: str, *, thinking: boo
         return ""
     msg = (data.get("choices") or [{}])[0].get("message") or {}
     out = (msg.get("content") or "").strip()
+
+    # 把思维链推给 GUI（界面「思考过程」区展示）。只在带 chat_meta 的正式回复调用时推，
+    # 判定类调用（judge，thinking=False）本来就没有思维链。
+    reasoning = str(msg.get("reasoning_content") or "").strip()
+    if reasoning and chat_meta:
+        try:
+            BUS.event("thinking", chat=chat_meta.get("chat", ""),
+                      sender=chat_meta.get("sender", ""), text=reasoning)
+        except Exception:  # noqa: BLE001
+            pass  # 推送失败绝不能影响回复主流程
+
     if not out:
-        reasoning = str(msg.get("reasoning_content") or "")
         if reasoning:
             log_line(f"[AI 空回复] 思维链吃掉了 max_tokens（{reasoning[:40]!r}…），"
                      f"需要显式 thinking=disabled 或调大 max_tokens")
@@ -320,7 +352,8 @@ def ai_reply(cfg: dict, content: str, sender: str, chat_name: str, is_group: boo
                       timeout=cfg.get("timeout", 20),
                       temperature=cfg.get("temperature", 1.2),
                       reasoning_effort=cfg.get("reasoning_effort", "high"),
-                      api_key=api_key, images=images)
+                      api_key=api_key, images=images,
+                      chat_meta={"chat": chat_name, "sender": sender})
     if not text:
         return ""
     text = text.strip("「」\"'“”").strip()
@@ -740,6 +773,9 @@ def account_guard(db, lock_wxid: str) -> str:
     多账号时上游库按「数据库最近改动」挑账号，换号后可能读到另一个号的库，
     而 sender_id 是按账号编号的——**会把新号的自己发的消息当成别人发的，于是回复自己**。
     返回 "ok" / "switched" / "unknown"。
+
+    "unknown"（读不到）常见诱因是数据库连接的偶发抖动，**一次读不到不代表微信掉线**，
+    所以调用方（主循环）要求连续多次 unknown 才告警 —— 见 GUARD_UNKNOWN_STREAK。
     """
     try:
         cur = (db.get_self_info() or {}).get("username") or ""
@@ -748,6 +784,12 @@ def account_guard(db, lock_wxid: str) -> str:
     if not cur:
         return "unknown"
     return "ok" if cur == lock_wxid else "switched"
+
+
+# 账号状态连续读不到多少次（每次心跳 60s）才认定「真出问题了」并告警。
+# 单次抖动/连接重建时 get_self_info 偶发异常是已知现象（2026-10-25 观察到
+# 连续 13 次误报、期间机器人功能完全正常），所以要攒够 streak 才值得打扰用户。
+GUARD_UNKNOWN_STREAK = 3
 
 
 # --------------------------------------------------------------------------
@@ -1169,6 +1211,38 @@ def split_sentences(raw: str, max_chars: int = 0, max_parts: int = 0) -> list:
         if seg:
             chunks.append(seg)
 
+    # 兜底：非结尾的超短句（≤4 字）不单独发一条。对方昵称带句号（如「杨。」）时，
+    # 模型在句首一挂称呼就会被切成孤儿条（2026-11-01 实测连发 8 次，见 §7.25）；
+    # 被问号切飞的「♪」、开头的「：」这类符号碎片也一并吸收。
+    if len(chunks) > 1:
+        merged = [chunks[0]]
+        head_short = len(chunks[0]) <= 4
+        for c in chunks[1:]:
+            if head_short or len(c) <= 4:
+                merged[-1] = merged[-1] + c
+                head_short = head_short and len(c) <= 4
+            else:
+                merged.append(c)
+        # 结尾的纯符号碎片（如「…有戏了？♪」被切出的「♪」）并回上一句
+        if len(merged) > 1 and not merged[-1].strip("…~♪♡、，。；：!?？！· "):
+            merged[-2] = merged[-2] + merged.pop()
+        chunks = merged
+
+    # 兜掉聊天记录格式残留：模型偶尔学着上下文写成「名字：…」「我：…」（§7.25），
+    # 每条开头的「称呼+冒号」直接剥掉——「某某。：」「某某: 」这类前缀不许出门。
+    # 只剥「1~2 个中文字+冒号」，且白名单里的正经标签（原因/办法/步骤…）不剥
+    keep_labels = {"原因", "结果", "办法", "方法", "比如", "例如", "注意", "结论",
+                   "建议", "问题", "步骤", "例子", "关键", "重点", "信号", "症状",
+                   "第二", "第三", "补充", "反正"}
+
+    def _strip_talk_prefix(c: str) -> str:
+        m = re.match(r"^([一-鿿。·]{1,2})[：:]\s*", c)
+        if m and m.group(1) not in keep_labels:
+            return c[m.end():] or c
+        return c
+
+    chunks = [_strip_talk_prefix(c) for c in chunks]
+
     limit = int(max_chars or 0)
     if limit > 0:
         out: list = []
@@ -1578,15 +1652,39 @@ def main():
     import atexit
     atexit.register(release_lock)
 
-    db = WeChatDB()
+    # 双开（大小号同时登录）时自行判断用哪个号：上游库默认按「数据库最近改动」挑账号，
+    # 但双开下两个号都在写库，可能挑错。这里把所有候选账号的「最近活动时间」比一遍，
+    # 取最新的那个（最近在聊天的就是当前活跃号）。挑完后显式传给 WeChatDB，
+    # 避免上游启发式选错。
+    picked_account = None
+    try:
+        from wechatauto.db import list_accounts as _list_accounts
+        _acts = _list_accounts() or []
+        if len(_acts) >= 2:
+            _acts_sorted = sorted(_acts, key=lambda a: a.get("last_activity") or 0, reverse=True)
+            picked_account = _acts_sorted[0].get("account")
+            import datetime as _dt
+            _names = [f"{a.get('wxid')}({_dt.datetime.fromtimestamp(a.get('last_activity') or 0):%H:%M})"
+                      for a in _acts_sorted]
+            print(f"  双开检测：{len(_acts)} 个账号，按最近活动排序 → {' > '.join(_names)}", flush=True)
+            print(f"  选定账号：{picked_account}（最近活动的那个）", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [警告] 账号活跃度检测失败，退回上游默认选择：{type(e).__name__}: {e}", flush=True)
+        picked_account = None
+
+    db = WeChatDB(account=picked_account)
     resolver = SenderResolver(db)
     info = db.get_self_info()
     lock_wxid, lock_nick, lock_self_id, extra_ids = _account_identity(db)
 
     api_key = load_api_key()
     if not api_key:
-        print("[错误] 没拿到 DEEPSEEK_API_KEY（环境变量或 ~/.dsh/.credentials.yaml）")
+        print("[错误] 没拿到 API Key（环境变量 / apikey.txt / ~/.dsh/.credentials.yaml 三处都没有）")
         return 1
+    # 启动时打印本次生效的 provider / base_url / model，便于一眼确认接的是哪家
+    print(f"  AI: provider={cfg.get('ai', {}).get('provider')} "
+          f"base_url={cfg.get('ai', {}).get('base_url')} "
+          f"model={cfg.get('ai', {}).get('model')}", flush=True)
 
     policy = ReplyPolicy(cfg, resolver, db)
     policy.api_key = api_key
@@ -1834,6 +1932,8 @@ def main():
     lst.start()
     print("机器人运行中（Ctrl+C 停止）...", flush=True)
     last_check = time.time()
+    unknown_streak = 0          # 账号状态连续读不到的次数（连续够 GUARD_UNKNOWN_STREAK 才告警）
+    unknown_warned = False      # 当前这轮 streak 是否已经告过警（避免每次都重复刷日志）
     try:
         while True:
             time.sleep(1)
@@ -1850,12 +1950,25 @@ def main():
                     print("\n[!] 登录账号变了，机器人已退出。请重新双击 restart_bot.bat 启动。")
                     break
                 if state == "unknown":
-                    BUS.set_status(online=False)
-                    BUS.event("warn", text="微信账号状态读不到，可能已退出登录")
-                    # 微信可能掉线了 —— 这期间她一条都不会回，必须留痕
-                    log_line(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ⚠ 账号状态读不到"
-                             f"（微信可能已退出登录或窗口异常），继续观察")
+                    unknown_streak += 1
+                    if unknown_streak >= GUARD_UNKNOWN_STREAK:
+                        BUS.set_status(online=False)
+                        if not unknown_warned:
+                            unknown_warned = True
+                            BUS.event("warn", text="账号状态连续读不到，正在持续观察")
+                            # 措辞：这不是「微信掉线」，而是「机器人这次没读到账号状态」——
+                            # 常见原因是连接偶发抖动，通常会自愈；连续多次才值得提醒。
+                            log_line(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ⚠ 账号状态连续"
+                                     f"{unknown_streak} 次读不到（连接偶发抖动或多账号数据异常），"
+                                     f"持续观察中；微信掉线可能性低")
                 else:
+                    # 一旦读到一次就重置 streak 并撤掉告警状态 —— 证明抖动已过去
+                    if unknown_streak and unknown_warned:
+                        BUS.event("system", text="账号状态已恢复读取")
+                        log_line(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ✓ 账号状态已恢复读取"
+                                 f"（此前连续 {unknown_streak} 次读不到，判定为偶发抖动）")
+                    unknown_streak = 0
+                    unknown_warned = False
                     BUS.set_status(online=True)
     except KeyboardInterrupt:
         pass
