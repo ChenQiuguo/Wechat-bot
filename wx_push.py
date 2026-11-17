@@ -178,14 +178,67 @@ def clean_content(content: str, mtype: str) -> str:
     return text
 
 
+# ---- 会话别名：裸 ID → 显示名（§7.29）----
+# db.get_nickname 偶发查不到/抛异常时会退回裸 ID，同一会话就裂成两条（GUI 列表出现
+# 「<群ID>@chatroom」和「<群名>」并存）。这里把成功解析的结果记进
+# chat_alias.json：失败时用别名兜底，成功时顺手刷新（群改名也能跟上）。
+_ALIAS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_alias.json")
+_alias_map: dict = {}
+_alias_loaded = False
+
+
+def _alias_get(username: str) -> str:
+    global _alias_loaded
+    if not _alias_loaded:
+        try:
+            with open(_ALIAS_PATH, encoding="utf-8") as f:
+                _alias_map.update(json.load(f))
+        except Exception:
+            pass
+        _alias_loaded = True
+    return _alias_map.get(username, "")
+
+
+def _alias_put(username: str, name: str):
+    if not username or not name or username == name or _alias_map.get(username) == name:
+        return
+    _alias_map[username] = name
+    try:
+        # ⚠️ 先把磁盘上的内容读回来再合并写：机器人和面板是两个进程，
+        # 直接 dump 内存里的 map 会把别人刚写进去的条目抹掉（§7.31 踩过，别名表只剩 1 条）
+        disk: dict = {}
+        try:
+            with open(_ALIAS_PATH, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                disk = {str(k): str(v) for k, v in loaded.items() if k and v}
+        except Exception:
+            pass
+        disk.update(_alias_map)
+        _alias_map.update(disk)
+        tmp = _ALIAS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(disk, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, _ALIAS_PATH)
+    except Exception:
+        pass
+
+
 def build_payload(db: WeChatDB, resolver: SenderResolver, msg: dict) -> dict:
     username = msg.get("username") or ""
     is_group = "@chatroom" in username
     is_self, sender_wxid, sender = resolver.resolve(msg)
+    resolved = ""
     try:
-        chat_name = db.get_nickname(username) or username
+        resolved = db.get_nickname(username) or ""
     except Exception:
-        chat_name = username
+        resolved = ""
+    if resolved and resolved != username:
+        chat_name = resolved
+        _alias_put(username, resolved)
+    else:
+        # 查不到（或抛异常）→ 别名兜底；没有别名才退回裸 ID
+        chat_name = _alias_get(username) or username
     if chat_name == username and not username:
         chat_name = "(未知会话)"
 

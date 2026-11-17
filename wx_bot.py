@@ -38,6 +38,8 @@ from wechatauto.db import WeChatDB, Listener
 from wechatauto.uia_driver import SESSION_LIST_AIDS, _aid_hit, _find_by
 import kb_input
 import memory_store
+import memory_vec
+import chat_alias
 import image_in
 from wx_push import SenderResolver, build_payload, clean_content, fmt_time, _as_text
 
@@ -174,7 +176,7 @@ def load_api_key() -> str:
 
 def build_history(db: WeChatDB, resolver: "SenderResolver", chat_username: str,
                   limit: int = 8, exclude_local_id=None, max_age_minutes: int = 0,
-                  min_recent: int = 3) -> list:
+                  min_recent: int = 3, max_tokens: int = 0) -> list:
     """取该会话最近若干条消息作为上下文。
 
     纯文本才喂给模型；媒体消息只留一个占位说明（图片的具体内容只喂当前这条，
@@ -184,6 +186,10 @@ def build_history(db: WeChatDB, resolver: "SenderResolver", chat_username: str,
     能一路翻回几小时前，把无关的旧话（比如主人自己调试时发的测试消息）也喂进去，
     模型会顺着那些旧话接茬。窗口内至少要留 ``min_recent`` 条，不够就放宽成「最近几条」，
     免得把上下文清空导致判定失准。
+
+    ``max_tokens`` > 0 时再按**token 预算**从新往旧截：MiMo v2.6 窗口是 1M，
+    预算配到百万级就等于「这个会话能翻到的历史全带上」，但不会把请求撑爆。
+    估算用「1 个字符 ≈ 1 token」（中文偏保守），宁少勿多。
     """
     try:
         msgs = db.get_messages(chat_username, limit=limit + 2)
@@ -214,7 +220,21 @@ def build_history(db: WeChatDB, resolver: "SenderResolver", chat_username: str,
     if max_age_minutes:
         # 窗口内太少就退回「最近几条」，别把上下文清空
         lines = fresh if len(fresh) >= int(min_recent) else lines[-max(int(min_recent), 1):]
-    return lines[-limit:]
+    lines = lines[-limit:]
+    if max_tokens and max_tokens > 0:
+        budget = int(max_tokens)
+        picked, used = [], 0
+        for line in reversed(lines):
+            cost = len(line) + 1
+            if picked and used + cost > budget:
+                break
+            picked.append(line)
+            used += cost
+        picked.reverse()
+        if len(picked) < int(min_recent):
+            picked = lines[-max(int(min_recent), 1):]
+        lines = picked
+    return lines
 
 
 def _chat_call(cfg: dict, system_prompt: str, user_prompt: str, *, thinking: bool,
@@ -327,8 +347,10 @@ def ai_reply(cfg: dict, content: str, sender: str, chat_name: str, is_group: boo
 
     ident = ""
     if me_name:
-        ident = (f"你的微信昵称是「{me_name}」，你就是本人，用第一人称说话；"
-                 f"别人写 @{me_name} 就是在叫你。\n\n")
+        # 只交代「显示名 ↔ 别人叫你」的映射；你是谁由 system_prompt（人设）说了算，
+        # 这里不再断言「你就是本人[显示名]」——否则会和人设打架（2026-11-02 起人设可切换）
+        ident = (f"你的微信昵称显示为「{me_name}」，别人写 @{me_name} 就是在叫你，"
+                 f"用第一人称说话，别把自己当第三方。\n\n")
 
     ctx = ""
     if history:
@@ -514,7 +536,8 @@ def unsolicited_fill(ai_cfg: dict, me_name: str, chat_name: str, sender: str,
     )
     ident = ""
     if me_name:
-        ident = f"你的微信昵称是「{me_name}」，你就是本人，用第一人称说话。\n\n"
+        ident = (f"你的微信昵称显示为「{me_name}」，别人叫这个名字就是在叫你，"
+                 f"用第一人称说话，别把自己当第三方。\n\n")
     ctx = ""
     if history:
         ctx = "群里最近的记录（最后一条就是刚收到的）：\n" + "\n".join(history) + "\n\n"
@@ -949,7 +972,16 @@ class ReplyPolicy:
             # ① 直接 @ 我：最高优先，一定回（哪怕正文里还 @ 了别人）
             at_me = next((n for n in self.at_names if f"@{n}" in text), None) or \
                 next((n for n in self.name_hits if f"@{n}" in text), None)
-            if not at_me:
+            # ② 点名：只认「正文里喊了我的名字」（不再花钱跑话题判定）。
+            #    `trigger.group_at_only`（默认 true，2026-11-17 用户要求）：
+            #    群里只有 @ 我 或 喊我名字 才接，话题判定与「接着聊」一律不走。
+            #    关掉（false）就退回老行为：话题相关 + 接着聊也能接，见 §7.5 / §7.18。
+            at_only = bool(self.trig.get("group_at_only", True))
+            if at_only:
+                called = _mentions_name(text, self.name_hits, name_owner)
+                if not (at_me or called):
+                    return False, "群里没@我/没喊名字"
+            elif not at_me:
                 # ② 只是「可能跟我有关」才值得花一次便宜的判定；
                 #    光出现我的名字不算——可能是顺口提到，或原话就跟我无关
                 cand = _mentions_name(text, self.name_hits, name_owner) \
@@ -1592,7 +1624,8 @@ def main():
         if not cu:
             cu = "filehelper"          # 默认沙盒：文件传输助手，绝不发到真人会话
         chat_name = db0.get_nickname(cu) or cu
-        hist = build_history(db0, res0, cu, int(qcfg["ai"].get("history_limit", 8)))
+        hist = build_history(db0, res0, cu, int(qcfg["ai"].get("history_limit", 8)),
+                             max_tokens=int(qcfg["ai"].get("history_max_tokens", 0) or 0))
         print(f"会话「{chat_name}」收到：{qa.can_answer}")
         print(f"  粗筛像是问题：{looks_like_question(qa.can_answer)}")
         if qa.can_answer_send:
@@ -1656,26 +1689,53 @@ def main():
     # 但双开下两个号都在写库，可能挑错。这里把所有候选账号的「最近活动时间」比一遍，
     # 取最新的那个（最近在聊天的就是当前活跃号）。挑完后显式传给 WeChatDB，
     # 避免上游启发式选错。
+    # 2026-11-01（用户点头加的钉号）：config.json 顶层 `account` 设了就按它选、
+    # 跳过活动度启发式——升 1.2.9 当晚活动度把号挑到了大号上（见 §7.26）。
     picked_account = None
-    try:
-        from wechatauto.db import list_accounts as _list_accounts
-        _acts = _list_accounts() or []
-        if len(_acts) >= 2:
-            _acts_sorted = sorted(_acts, key=lambda a: a.get("last_activity") or 0, reverse=True)
-            picked_account = _acts_sorted[0].get("account")
-            import datetime as _dt
-            _names = [f"{a.get('wxid')}({_dt.datetime.fromtimestamp(a.get('last_activity') or 0):%H:%M})"
-                      for a in _acts_sorted]
-            print(f"  双开检测：{len(_acts)} 个账号，按最近活动排序 → {' > '.join(_names)}", flush=True)
-            print(f"  选定账号：{picked_account}（最近活动的那个）", flush=True)
-    except Exception as e:  # noqa: BLE001
-        print(f"  [警告] 账号活跃度检测失败，退回上游默认选择：{type(e).__name__}: {e}", flush=True)
-        picked_account = None
+    _pin = str(cfg.get("account") or "").strip()
+    if _pin:
+        try:
+            from wechatauto.db import list_accounts as _la_pin
+            for _a in _la_pin() or []:
+                if _pin in (_a.get("account"), _a.get("wxid")) or \
+                        str(_a.get("account") or "").startswith(_pin + "_"):
+                    picked_account = _a.get("account")
+                    print(f"  配置钉号：{_pin} → {picked_account}（跳过活动度选号）", flush=True)
+                    break
+            if picked_account is None:
+                print(f"  [警告] config.account={_pin} 没匹配到本机账号，退回活动度选号", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"  [警告] 钉号解析失败，退回活动度选号：{type(e).__name__}: {e}", flush=True)
+            picked_account = None
+
+    if picked_account is None:
+        try:
+            from wechatauto.db import list_accounts as _list_accounts
+            _acts = _list_accounts() or []
+            if len(_acts) >= 2:
+                _acts_sorted = sorted(_acts, key=lambda a: a.get("last_activity") or 0, reverse=True)
+                picked_account = _acts_sorted[0].get("account")
+                import datetime as _dt
+                _names = [f"{a.get('wxid')}({_dt.datetime.fromtimestamp(a.get('last_activity') or 0):%H:%M})"
+                          for a in _acts_sorted]
+                print(f"  双开检测：{len(_acts)} 个账号，按最近活动排序 → {' > '.join(_names)}", flush=True)
+                print(f"  选定账号：{picked_account}（最近活动的那个）", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"  [警告] 账号活跃度检测失败，退回上游默认选择：{type(e).__name__}: {e}", flush=True)
+            picked_account = None
 
     db = WeChatDB(account=picked_account)
     resolver = SenderResolver(db)
     info = db.get_self_info()
     lock_wxid, lock_nick, lock_self_id, extra_ids = _account_identity(db)
+
+    # 会话别名自愈：chat_alias.json 是运行时文件，被清掉/写坏时面板里同一对话会裂成两条（§7.29）
+    try:
+        _fixed = chat_alias.repair(db)
+        if _fixed:
+            print(f"  会话别名：补了 {len(_fixed)} 条裸 ID", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [会话别名] 自愈失败（不影响运行）：{type(e).__name__}: {e}", flush=True)
 
     api_key = load_api_key()
     if not api_key:
@@ -1685,6 +1745,16 @@ def main():
     print(f"  AI: provider={cfg.get('ai', {}).get('provider')} "
           f"base_url={cfg.get('ai', {}).get('base_url')} "
           f"model={cfg.get('ai', {}).get('model')}", flush=True)
+    # 长期记忆（mem0 + 本地向量）：后台预热，别让第一条消息等模型加载
+    if memory_vec.enabled(cfg.get("ai", {})):
+        _v = memory_vec.vcfg(cfg.get("ai", {}))
+        print(f"  长期记忆: 开（mem0 + {_v.get('model') or 'BAAI/bge-small-zh-v1.5'}，"
+              f"库={_v.get('dir') or os.path.join(BASE_DIR, 'memory_vec')}，"
+              f"infer={bool(_v.get('infer', False))}）", flush=True)
+        threading.Thread(target=memory_vec.warmup,
+                         args=(cfg.get("ai", {}), api_key), daemon=True).start()
+    else:
+        print("  长期记忆: 关（config.json → ai.memory.vector.enabled）", flush=True)
 
     policy = ReplyPolicy(cfg, resolver, db)
     policy.api_key = api_key
@@ -1793,18 +1863,39 @@ def main():
 
     lst = Listener(db, interval=1.0)
 
-    def build_mem_block(payload: dict) -> str:
-        """关系说明 + 记忆档案 + 本群成员名单（都注入，避免认错人/编名字）。"""
+    def build_mem_block(payload: dict, history: list | None = None) -> str:
+        """关系说明 + 记忆档案 + 长期记忆召回 + 本群成员名单（都注入，避免认错人/编名字）。"""
         block = relation_block(cfg["ai"], payload)
         if block:
             print(f"  · 已注入「{payload['chat_name']}」的关系说明", flush=True)
-        if cfg["ai"].get("memory", {}).get("enabled", True):
+        # 记忆档案按会话类型分开关：memory.enabled 总开关 + memory.group_enabled 群聊分开关
+        # （2026-11-02：群聊不进数据库，只有私聊建档；某好友的私聊档继续开）
+        _mcfg = cfg["ai"].get("memory", {}) or {}
+        _mem_on = bool(_mcfg.get("enabled", True)) and (
+            bool(_mcfg.get("group_enabled", True)) or not payload["is_group"])
+        if _mem_on:
             try:
-                block = memory_store.prompt_block(memory_store.load(payload["chat_username"]))
+                mb = memory_store.prompt_block(memory_store.load(payload["chat_username"]))
             except Exception as e:  # noqa: BLE001
+                mb = ""
                 print(f"  [读取记忆失败] {type(e).__name__}: {e}", flush=True)
-            if block:
+            if mb:
+                # 追加而不是覆盖：旧逻辑 `block = ...` 会把上面刚注入的关系说明顶掉
+                block = (block + "\n\n" + mb) if block else mb
                 print(f"  · 已注入 {payload['chat_name']} 的记忆档案", flush=True)
+        # 长期记忆（mem0 + 本地向量）：按这条消息的语义捞回以前聊过的相关片段。
+        # 只在这种会话真的建档时才用（群聊默认不建），且与当前上下文重复的会被丢掉。
+        if _mem_on and memory_vec.enabled(cfg["ai"]):
+            try:
+                vb = memory_vec.block(cfg["ai"], payload["chat_username"],
+                                      (payload.get("content") or "")[:200],
+                                      history or [])
+            except Exception as e:  # noqa: BLE001
+                vb = ""
+                print(f"  [长期记忆召回失败] {type(e).__name__}: {e}", flush=True)
+            if vb:
+                block = (block + vb) if block else vb.lstrip("\n")
+                print(f"  · 已注入 {payload['chat_name']} 的长期记忆片段", flush=True)
         if payload["is_group"]:
             try:
                 roster = resolver.roster(payload["chat_username"])
@@ -1854,10 +1945,17 @@ def main():
     def _on_msg_inner(msg: dict, _lst: Listener):
         payload = build_payload(db, resolver, msg)
         if not payload["is_self"]:
-            policy._last_incoming[payload["chat_username"]] = time.time()
-            BUS.event("recv", chat=payload["chat_name"], sender=payload["sender"],
-                      text=(payload["content"] or "")[:80])
-            BUS.set_status(last_msg_time=time.time())
+            # 停机补投的旧消息只进日志、不进 GUI：重启后几十上百条旧消息会以「现在」
+            # 的事件时间插到新消息后面，对话流看着就乱序（§7.27）。新鲜度判据与
+            # policy.check 的 max_age_seconds 完全一致；_last_incoming 同理不刷新——
+            # 几十分钟前的消息不代表「该会话正在聊」（§7.9 的图片闸门语义）。
+            _fresh = (time.time() - float(payload.get("timestamp") or 0)
+                      <= float(cfg["trigger"].get("max_age_seconds", 120) or 120))
+            if _fresh:
+                policy._last_incoming[payload["chat_username"]] = time.time()
+                BUS.event("recv", chat=payload["chat_name"], sender=payload["sender"],
+                          text=(payload["content"] or "")[:80])
+                BUS.set_status(last_msg_time=time.time())
         # 图片消息：先取图（policy.check 要用它判断该不该回，生成回复时直接复用）
         local_id = msg.get("local_id")
         policy.pending_image = None
@@ -1872,6 +1970,7 @@ def main():
             db, resolver, payload["chat_username"],
             int(cfg["ai"].get("history_limit", 8)), msg.get("local_id"),
             max_age_minutes=int(cfg["ai"].get("history_max_age_minutes", 0) or 0),
+            max_tokens=int(cfg["ai"].get("history_max_tokens", 0) or 0),
         )
         ok, reason = policy.check(payload, history)
         unsolicited = False
@@ -1898,13 +1997,13 @@ def main():
         if unsolicited:
             reply = unsolicited_fill(cfg["ai"], me_name, payload["chat_name"],
                                      payload["sender"], payload["content"], history,
-                                     build_mem_block(payload), api_key=api_key)
+                                     build_mem_block(payload, history), api_key=api_key)
         else:
             log_line(f"[{payload['time']}] 收到 {payload['chat_name']} | "
                      f"{payload['sender']}: {payload['content']}")
             reply = ai_reply(cfg["ai"], payload["content"], payload["sender"], payload["chat_name"],
                              payload["is_group"], history, me_name=me_name,
-                             mem_block=build_mem_block(payload), api_key=api_key,
+                             mem_block=build_mem_block(payload, history), api_key=api_key,
                              images=[policy.pending_image] if policy.pending_image else None)
         if not reply:
             log_line("  AI 未生成回复，跳过")
@@ -1916,8 +2015,10 @@ def main():
             uns.mark(payload["chat_username"])
         if send_multi(texts, payload["chat_username"], payload["chat_name"])[0]:
             BUS.set_status(reply_count_today=BUS.status().get("reply_count_today", 0) + len(texts))
-            # 异步更新记忆档案（不阻塞、不影响回复延迟）
-            if cfg["ai"].get("memory", {}).get("enabled", True):
+            # 异步更新记忆档案（不阻塞、不影响回复延迟）；群聊按 memory.group_enabled 拦掉
+            _mcfg2 = cfg["ai"].get("memory", {}) or {}
+            if bool(_mcfg2.get("enabled", True)) and (
+                    bool(_mcfg2.get("group_enabled", True)) or not payload["is_group"]):
                 lines = list(history or [])
                 lines.append(f"{payload['sender']}: {payload['content']}")
                 lines.append("我: " + " ".join(texts))
@@ -1927,9 +2028,139 @@ def main():
                           cfg["ai"], load_api_key(), cfg["ai"].get("memory", {})),
                     daemon=True,
                 ).start()
+                # 同一段对话也写进长期向量库（默认 infer=false：只做本地嵌入，不再调模型）
+                if memory_vec.enabled(cfg["ai"]):
+                    threading.Thread(
+                        target=memory_vec.remember,
+                        args=(cfg["ai"], payload["chat_username"], payload["chat_name"], lines),
+                        daemon=True,
+                    ).start()
 
     lst.add_all(on_msg, discover=True)
     lst.start()
+
+    # -- 主动开场（proactive）：会话安静够久，就按人设主动找配置里的人说句话 ----
+    # 触发条件（全部满足才发）：非免打扰时段 + 启动冷静期已过 + 距上次主动 >= interval_minutes
+    # + 该会话距最后一次互动 >= min_quiet_minutes + 当日主动次数 < max_per_day + 账号在线。
+    proactive_cfg = dict(cfg.get("proactive") or {})
+    _pro_state = {"day": time.strftime("%Y-%m-%d"), "count": 0}
+    _pro_last_sent: dict = {}
+    _pro_started = time.time()
+
+    def _in_quiet_hours(spec) -> bool:
+        """quiet_hours: [开始小时, 结束小时)，支持跨午夜，如 [1, 8] = 01:00-08:00 不打扰。"""
+        if not spec or len(spec) != 2:
+            return False
+        h = time.localtime().tm_hour
+        a, b = int(spec[0]) % 24, int(spec[1]) % 24
+        if a == b:
+            return False
+        return (a <= h < b) if a < b else (h >= a or h < b)
+
+    def _proactive_fill(me_name: str, chat_name: str, history, mem_block: str) -> str:
+        """没人发消息时，按人设主动起个头的开场白（只生成不发送）。"""
+        aicfg = dict(cfg["ai"])
+        ident = ""
+        if me_name:
+            ident = (f"你的微信昵称显示是「{me_name}」，别人叫那个名字也是在叫你；"
+                     f"按人设用自己的口吻说话，别自称那个昵称。\n\n")
+        ctx = ""
+        if history:
+            ctx = "最近的聊天记录：\n" + "\n".join(history) + "\n\n"
+        user_prompt = (
+            ident
+            + (mem_block.strip() + "\n\n" if mem_block else "")
+            + ctx
+            + f"现在没有任何人给你发消息，你想主动找「{chat_name}」说句话。"
+              "按你的性格自然地起个头：分享一件小事、问一句他的近况、接上之前聊过的话题都行。"
+              "一到两句话就够，别像群发、别问「在吗」、别用「名字：」开头，"
+              "也不要解释你是主动发的。"
+        )
+        text = _chat_call(aicfg, aicfg["system_prompt"], user_prompt,
+                          thinking=bool(aicfg.get("thinking", False)),
+                          max_tokens=int(aicfg.get("max_tokens", 1200) or 1200),
+                          timeout=float(aicfg.get("timeout", 30) or 30),
+                          temperature=float(aicfg.get("temperature", 1.2) or 1.2),
+                          reasoning_effort=aicfg.get("reasoning_effort", "low"),
+                          api_key=api_key)
+        if not text:
+            return ""
+        text = text.strip("「」\"'“”").strip().rstrip("。.").rstrip()
+        limit = int(aicfg.get("max_chars", 220) or 0)
+        if limit > 0:
+            text = text[:limit].rstrip()
+        return text
+
+    def _proactive_worker():
+        while True:
+            try:
+                time.sleep(60)
+                if not proactive_cfg.get("enabled"):
+                    continue
+                now = time.time()
+                if now - _pro_started < float(proactive_cfg.get("grace_minutes", 15) or 0) * 60:
+                    continue
+                today = time.strftime("%Y-%m-%d")
+                if today != _pro_state["day"]:
+                    _pro_state["day"], _pro_state["count"] = today, 0
+                if _pro_state["count"] >= int(proactive_cfg.get("max_per_day", 4) or 0):
+                    continue
+                if _in_quiet_hours(proactive_cfg.get("quiet_hours")):
+                    continue
+                if not (BUS.status() or {}).get("online", True):
+                    continue
+                for t in proactive_cfg.get("targets") or []:
+                    wxid = str(t.get("wxid") or "").strip()
+                    name = str(t.get("name") or wxid)
+                    if not wxid:
+                        continue
+                    if now - float(_pro_last_sent.get(wxid, 0)) \
+                            < float(proactive_cfg.get("interval_minutes", 180) or 0) * 60:
+                        continue
+                    # 最近一次会话活动（对方发的或自己发的都算「正在聊」）
+                    last_act = float(policy._last_incoming.get(wxid, 0) or 0)
+                    try:
+                        _m = db.get_messages(wxid, limit=1)
+                        if _m:
+                            last_act = max(last_act, float(_m[0].get("create_time") or 0))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if now - last_act < float(proactive_cfg.get("min_quiet_minutes", 60) or 0) * 60:
+                        continue
+                    history = build_history(
+                        db, resolver, wxid, int(cfg["ai"].get("history_limit", 8)),
+                        max_age_minutes=int(cfg["ai"].get("history_max_age_minutes", 0) or 0),
+                        max_tokens=int(cfg["ai"].get("history_max_tokens", 0) or 0))
+                    me_name = info.get("nick_name") or ""
+                    reply = _proactive_fill(
+                        me_name, name, history,
+                        build_mem_block({"is_group": False, "chat_username": wxid,
+                                         "chat_name": name, "content": ""}, history))
+                    if not reply:
+                        continue
+                    texts = split_for_send(reply, dict(cfg["ai"].get("multi_send") or {}))
+                    ok, _n = send_multi(texts, wxid, name)
+                    _pro_last_sent[wxid] = time.time()
+                    if ok:
+                        _pro_state["count"] += 1
+                        log_line(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 主动开场 → {name}: {reply}")
+                        BUS.event("system", text=f"主动开场 → {name}: {reply[:60]}")
+                        BUS.set_status(reply_count_today=(BUS.status() or {}).get("reply_count_today", 0) + len(texts))
+            except Exception as e:  # noqa: BLE001
+                log_line(f"[主动开场异常] {type(e).__name__}: {e}")
+
+    if proactive_cfg.get("enabled"):
+        threading.Thread(target=_proactive_worker, daemon=True).start()
+        _tg = "、".join(str(t.get("name") or t.get("wxid"))
+                       for t in (proactive_cfg.get("targets") or []))
+        print(f"主动开场：已启用 → {_tg}"
+              f"（间隔 {proactive_cfg.get('interval_minutes')} 分钟 / "
+              f"安静 {proactive_cfg.get('min_quiet_minutes')} 分钟 / "
+              f"每日上限 {proactive_cfg.get('max_per_day')} 次 / "
+              f"免打扰 {proactive_cfg.get('quiet_hours')}）", flush=True)
+    else:
+        print("主动开场：关（config.json → proactive.enabled；只回消息，不自己找话题）", flush=True)
+
     print("机器人运行中（Ctrl+C 停止）...", flush=True)
     last_check = time.time()
     unknown_streak = 0          # 账号状态连续读不到的次数（连续够 GUARD_UNKNOWN_STREAK 才告警）

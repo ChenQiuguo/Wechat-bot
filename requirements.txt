@@ -1,5 +1,12 @@
 # 核心依赖：微信 4.x 数据库解密 + UIA 自动化
-wechatauto-replica>=1.2.4.4
+wechatauto-replica>=1.2.9
 
 # 进程检测（单实例锁用）
 psutil>=5.9
+
+# ---- 可选 ----
+# 长期向量记忆（ai.memory.vector.enabled=true 时需要；不装会自动降级为只有 JSON 档案）
+# mem0ai
+# fastembed
+# 生成/改图标（webui/icon/make_icons.py）
+# pillow

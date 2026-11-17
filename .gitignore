@@ -6,6 +6,17 @@ wx_messages.jsonl
 
 # 联系人记忆（含聊天内容，绝不提交）
 memory/
+# 长期向量记忆（mem0 向量库，同样含聊天内容）
+memory_vec/
+# 会话别名表（运行时生成，含 wxid → 昵称）
+chat_alias.json
+# 监控台运行态
+bot_status.json
+bot_events.jsonl
+gui_port.txt
+media/
+start_out.log
+start_err.log
 
 # 密钥（千万不要提交）
 apikey.txt

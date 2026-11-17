@@ -16,6 +16,51 @@
 
 ---
 
+## [1.3.0] - 2026-11-17
+
+### 新增
+- 🖥️ **GUI 换成 Web 版**（`bot_gui.py` 重写为本地 HTTP 服务）
+  - Tkinter 退役；服务起来后自动用 Edge 应用窗打开（无地址栏），随机端口写入 `gui_port.txt`，再开一次复用已在跑的服务
+  - 前端是自研「粉雾璃光」监控台（`webui/`）：会话卡片 / 可筛选会话列表 / 日期胶囊 / 连发聚簇 / ◈ 思考块折叠 / 日志分色 / `#chat:xxx` 与 `#log` 深链 / JS 错误自诊断浮层
+  - 工具栏：启动 / 停止 / 重启 / 打开日志 / 打开配置 / 关闭界面（**关窗不杀机器人**）
+  - `python bot_gui.py` 开界面 0.5 秒后自动拉起机器人；`--attach` 只开界面
+- 🤖 **AI 引擎切到小米 MiMo**（`ai.provider="mimo"`、`base_url=https://api.xiaomimimo.com/v1`、`model=mimo-v2.6-flash`）
+  - ⚠️ 参数形状与 DeepSeek 不同：请求里发 `max_completion_tokens`、`thinking: {type: enabled|disabled}`、`reasoning_effort`（合法值 `none/low/medium/high`，写 `off` 会 400），由 `_chat_call()` 按 provider 门控
+  - 判定类调用仍统一 `thinking=disabled`（否则思维链会吃光 token、静默永远返回否）
+- 🌐 **联网搜索**（`ai.web_search`）：`max_keyword=3` / `limit=3` / `force_search=false`；⚠️ 需先在模型控制台启用搜索插件（有几分钟缓存）
+- 🧠 **上下文拉到 1M token**：`history_limit=5000` + 新增 `ai.history_max_tokens=1000000`（从新往旧累加，超预算就停，至少留 3 条）
+- 🧷 **长期向量记忆**（`memory_vec.py`）：mem0 + fastembed（`BAAI/bge-small-zh-v1.5`，512 维）+ 本地 qdrant
+  - 默认 `infer=false`：只走本地嵌入、不额外调模型（约 0.3s/条）
+  - 启动时后台预热，不在回复路径上阻塞；依赖缺失/模型下不下来都只打一行日志，自动降级为只有 JSON 档案
+  - 注意会往 `memory_vec/` 写向量库（含聊天内容，已在 `.gitignore`）
+- 🏷️ **会话别名自愈**（`chat_alias.py`）：昵称瞬时解析失败会退回裸 ID，导致面板里同一会话裂成两条；现在启动时扫事件流把显示名补进 `chat_alias.json`（原子写 + 先读回合并，避免多进程互覆盖）
+- 🔕 **群里只回 @ / 喊名字**（`trigger.group_at_only=true`）：话题判定与「接着聊」直接短路，不花判定 token；`unsolicited.enabled=false` 关掉「有人提问就主动接」
+- 🎨 **图标 / 头像可一键生成**（`webui/icon/make_icons.py`）：一张方图 → `favicon.ico` 多尺寸 + `icon-*.png` + `avatar.png`（16–48px 裁到脸部 + 锐化）
+- 🛠️ 新增工具脚本：`tools/test_group_at_only.py`（群触发自查）、`tools/check_account.py`、`tools/export_history.py`、`tools/probe_focus_after_open.py`、`tools/probe_send_filehelper.py`
+
+### 变更
+- ⬆️ 底层库升级 `wechatauto-replica 1.2.4.4 → 1.2.9`（上游修了 sender_id / 历史重放 / 回读确认等老坑）
+- 📌 **账号钉号** `config.account`：设了就按它选号、跳过活动度启发式，避免双开时挑错号
+- 🎛️ 提示词人设重写（角色卡口径）：明亮俏皮 + 自称「人家」混用 + ♪ 只放句尾且低频；**禁止括号包的动作/神态**、禁止用对方名字开场
+- ⚙️ 参数：`max_chars=220`、`max_tokens=1200`、`thinking=true` + `reasoning_effort=low`
+
+### 修复
+- 🔧 **昵称带句号（如「杨。」）被切分器切成孤儿消息**：切句前先剥离称呼前缀，避免「称呼」单独发出去
+- 🔧 **回复用对方名字开头**：提示词 + 切分器双约束，统一只用「你」/「伙伴」
+- 🔧 **面板会话裂成两条**：见上「会话别名自愈」
+- 🔧 **GUI 对话流乱序**：停机补投的旧消息只进日志、不进面板；历史洪峰一次清掉
+- 🔧 **同一条消息在事件流里重复记录**：`recv` 事件只写新鲜消息
+
+### 安全
+- 🔒 **打包脚本**（`build_package.py`）递归安全扫描保持生效：命中真实昵称 / 联系人 / wxid / 群号直接拒绝生成；新增对本机绝对路径（含用户名）的兜底替换
+
+### 已知限制
+- ⚠️ **后台发送不可行**：wechatauto 依赖微信窗口可见（UIA 需要窗口在 UI 树里可访问），最小化或被遮挡时找不到输入框；发送瞬间窗口需可见，但不会抢焦点
+- ⚠️ **同一时间只能跑一个实例**：两个进程会抢解密缓存（第二个报 `PermissionError [WinError 5]`）；起机前不要无脑删 `bot.lock`（会删掉活实例的锁导致双开）
+- ⚠️ 起机前如果你刚重启过微信，第一次解析可能需要几秒；消息超过 `trigger.max_age_seconds`（120s）会被当作过期跳过，日志里会写「消息过期」
+
+---
+
 ## [1.2.1] - 2026-10-25
 
 ### 修复
@@ -219,5 +264,5 @@
 
 ---
 
-**最后更新：** 2026-10-25
+**最后更新：** 2026-11-17
 **维护者：** ChenQiuguo

@@ -1,0 +1,63 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>♪ 你的昵称 ♡</title>
+    <link rel="icon" href="icon/favicon.ico?v=20261114d" sizes="any"/>
+    <link rel="icon" type="image/png" href="icon/icon-32.png?v=20261114d" sizes="32x32"/>
+    <link rel="apple-touch-icon" href="icon/icon-256.png?v=20261114d"/>
+    <link rel="stylesheet" href="css/ui.css"/>
+</head>
+<body>
+<div class="app">
+    <header class="top">
+        <div class="brand">
+            <div class="mark"><img src="icon/avatar.png" alt=""/></div>
+            <div class="brand-txt">
+                <div class="title">你的昵称 <span class="heart">♡</span></div>
+                <div class="sub">微信自动回复 · 本机监控台</div>
+            </div>
+        </div>
+        <div class="top-right">
+            <div class="status" id="status-pill">
+                <span class="dot" id="status-dot"></span>
+                <span id="status-text">连接中…</span>
+            </div>
+            <div class="actions">
+                <button class="btn primary" id="btn-start" title="启动机器人">▶ 启动</button>
+                <button class="btn danger" id="btn-stop" title="停止机器人">⏹ 停止</button>
+                <button class="btn" id="btn-restart" title="重启机器人">↻ 重启</button>
+                <span class="vdiv"></span>
+                <button class="btn ghost" id="btn-logfile" title="打开 bot_replies.log">📄</button>
+                <button class="btn ghost" id="btn-config" title="打开 config.json">⚙</button>
+                <button class="btn ghost" id="btn-quit" title="关闭界面（机器人继续运行）">✕</button>
+            </div>
+        </div>
+    </header>
+
+    <div class="body">
+        <aside class="side">
+            <div class="side-head"><span>会话</span><span class="side-count" id="sess-count">0</span></div>
+            <div class="search">
+                <span class="sicon">⌕</span>
+                <input id="search" placeholder="筛选会话…" autocomplete="off"/>
+            </div>
+            <nav class="sessions" id="session-list"></nav>
+            <div class="side-foot">♪ 数据只在本机 · 关窗不杀机器人</div>
+        </aside>
+
+        <main class="main">
+            <div class="main-head">
+                <div class="mh-left">
+                    <h2 id="view-title">全部会话</h2>
+                    <span class="mh-meta" id="view-meta"></span>
+                </div>
+            </div>
+            <div class="stream" id="stream"></div>
+        </main>
+    </div>
+</div>
+<script src="js/app.js"></script>
+</body>
+</html>
