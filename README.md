@@ -4,9 +4,14 @@
 [![MiMo](https://img.shields.io/badge/MiMo-API-green.svg)](https://platform.xiaomimimo.com/)
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-> 一套**微信 4.x 自动回复机器人**：私聊自动回复、群里**只有被 @ 或喊名字才回**（可选：话题相关也接 / 有人提问时主动接）、**1M token 长上下文**、开思考模式（`reasoning_effort=low`）、内置**联网搜索**、**长期向量记忆**（mem0 + 本地嵌入）、**说话口吻可定制**（人设写在 `config.json` 的 `system_prompt` 里）、**回复一句一条发**、**发送不碰剪贴板**、带安全红线、**多账号守卫**、自带一套**本地 Web 监控台**。
+> 一套**微信 4.x 自动回复机器人**：私聊自动回复、群里**只有被 @ 或喊名字才回**（可选：话题相关也接 / 有人提问时主动接）、**对方连发多条合并成一次回复**、**1M token 长上下文**、开思考模式（`reasoning_effort=low`）、内置**联网搜索**、**长期向量记忆**（mem0 + 本地嵌入）、**说话口吻可定制**（人设写在 `config.json` 的 `system_prompt` 里）、**回复一句一条发**、**发送不碰剪贴板**、带安全红线、**多账号守卫**、自带一套**本地 Web 监控台**。
 
-**v1.3.0（2026-11-17）主要变化**：
+**v1.3.1（2026-11-18）主要变化**：
+- 🔧 **发送不再重复点会话**：目标会话已经打开就直接打字（微信 4.x 里点已高亮的会话行 = 关掉会话，输入框会跟着没）；单条失败时先「把焦点交回输入框」，还不行才点列表
+- ✅ **连发合并**：对方一口气发两三条时，合并成一段话**只回一次**（`ai.batching`，默认 1200ms 窗口、最多 5 条）
+- ⚡ **提示词放宽**：去掉「5～15 字」「三句上限」一堆硬限制，长短跟着话题走；口吻优先于「像人打字」，角色味道和红线都保留
+
+**v1.3.0（2026-11-17）**：
 - 🖥️ **GUI 换成 Web 版**：Tkinter 退役，`bot_gui.py` 现在是本地 HTTP 服务（Edge 应用窗打开，随机端口复用），前端是自研「粉雾璃光」监控台——会话卡片 / 日期胶囊 / 连发聚簇 / ◈ 思考块折叠 / 日志分色 / `#chat:xxx` 深链 / JS 错误自诊断浮层
 - 🤖 **AI 引擎切到小米 MiMo**（`mimo-v2.6-flash`，OpenAI 兼容接口，**参数形状与 DeepSeek 不同**），并开启 **web_search 联网搜索**
 - 🧠 **上下文拉到 1M token**（`history_limit=5000` + `history_max_tokens=1000000`）
@@ -42,6 +47,7 @@
   - **接着聊**（`group_followup_seconds=90`）：她刚回过的人 90 秒内再说一句也接
 - **有人提问时主动接**（`unsolicited.enabled`，**默认关**）：只接群里「确实答得上来的问题」，私聊永不主动
 - **一句话一条发**：多句回复按句子拆成多条消息（最多 4 条），更像人在打字
+- **连发合并**：对方一口气发两三条，等一个短窗口合成一段话、**只回一次**（`ai.batching`，关掉即退回首条即回）
 - **思考模式**：`ai.thinking=true` + `reasoning_effort=low`（MiMo 合法值 `none/low/medium/high`）
 - **联网搜索**：`ai.web_search.enabled`，模型判断需要时自己搜（省 token：`force_search=false`）
 
@@ -52,6 +58,7 @@
 
 ### 发送
 - **一句一条**、**只打开一次会话连发多条**
+- **会话已经打开就不再点**：发送前先读「当前会话」，是目标会话就直接打字（微信 4.x 里点已高亮的会话行等于关闭它）；单条失败时先「把焦点交回输入框」重试，还不行才点会话列表
 - **发送不碰剪贴板**：`kb_input.py` 用 `SendInput` + `KEYEVENTF_UNICODE` 逐字注入，校验输入框内容一致；失败可回退剪贴板（`input.fallback_clipboard`，默认关）
 - **发送确认**：发完回读数据库确认，确认不到才算失败并重试（有落库水位门槛，不会重发两遍）
 - **节流**：每会话冷却 + 每分钟/每天上限；另有上游库节奏层（`rhythm=fast`）
@@ -197,6 +204,9 @@ bot_gui.py (本地 HTTP 服务 + Edge 应用窗)
 | `ai.history_max_age_minutes` | `0` | 只带这么久以内的上下文（0 = 不限） |
 | `ai.multi_send.mode` | `sentence` | `sentence` 一句一条 / `separator` 只按 `\|\|\|` 切 / 关 |
 | `ai.multi_send.max_messages` | `4` | 一次最多发几条 |
+| `ai.batching.enabled` | `true` | 连发合并：同一人短窗口内连发多条 → 合成一次回复 |
+| `ai.batching.wait_ms` | `1200` | 合并窗口（毫秒）；调大会等更久但合并得更多 |
+| `ai.batching.max_messages` | `5` | 一批最多合并几条、回复条数上限也按它放宽 |
 | `ai.memory.max_facts` | `25` | 每个联系人的事实条数上限 |
 | `ai.memory.vector.enabled` | `true` | 长期向量记忆（依赖 mem0 + fastembed） |
 | `ai.memory.vector.infer` | `false` | `true` = 让 mem0 额外调模型做事实抽取（更贵） |
@@ -265,6 +275,11 @@ python webui/icon/make_icons.py
 ## 更新日志
 
 完整更新日志见 [CHANGELOG.md](CHANGELOG.md)。
+
+### v1.3.1 (2026-11-18)
+- 🔧 修发送时重复点会话把输入框点掉；单条失败先重设输入框焦点
+- ✅ 连发合并（`ai.batching`）：对方一口气发几条只回一次
+- ⚡ 提示词放宽：长短跟着话题走、口吻优先于「像人打字」，红线未动
 
 ### v1.3.0 (2026-11-17)
 - 🖥️ GUI 换成 Web 版（本地 HTTP 服务 + Edge 应用窗 + 自研「粉雾璃光」前端），Tkinter 退役

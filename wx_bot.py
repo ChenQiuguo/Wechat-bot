@@ -1412,9 +1412,81 @@ def _short(resp, limit: int = 60) -> str:
     return s if len(s) <= limit else s[:limit] + "…"
 
 
+def _chat_matches(cur: str, targets) -> bool:
+    """当前打开会话名是否就是要发的那个（含「某某与某某的聊天」这种独立窗标题）。"""
+    cur = (cur or "").strip()
+    if not cur:
+        return False
+    for n in targets or []:
+        n = (n or "").strip()
+        if not n:
+            continue
+        if cur == n or cur in n or n in cur:
+            return True
+    return False
+
+
+def _window_ok(uia) -> bool:
+    try:
+        return bool(uia.ensure_window())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _focus_chat_input(uia) -> bool:
+    """把键盘焦点交回输入框——**不点鼠标、不重开会话**。
+
+    用户 2026-11-18 的原话：「输入框已经到了这个对话，就不用再点一遍；重复点还会把输入框点掉」。
+    微信 4.x 里再点一次已经是当前高亮的会话行，行为等于「关闭会话」，命中率低得多；
+    所以失败时优先走这里：焦点交给输入框控件，再按一次输入框里已有的内容校验一遍。
+    """
+    try:
+        ctrl = uia._chat_input()      # noqa: SLF001 —— 上游私有方法，与补丁里同一处用法
+        if ctrl is None:
+            return False
+        try:
+            ctrl.SetFocus()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            uia._win.SetFocus()       # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(0.15)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ensure_chat_open(get_gui, names, uia=None) -> tuple:
+    """确保目标会话是**当前打开的**会话，返回 (是否就绪, 说明)。
+
+    顺序照用户要求排：已经在目标会话 → 什么都不做；不在 → 才点会话列表；
+    都没有可点的名字 → 交给上层走搜索。**绝不因为「不确定」就重复点已打开的会话。**
+    """
+    gui = get_gui()
+    try:
+        u = uia if uia is not None else gui._get_uia()  # noqa: SLF001
+    except Exception as e:  # noqa: BLE001
+        return False, f"UIA 不可用（{type(e).__name__}）"
+    if u is None:
+        return False, "UIA 暂不可用"
+    if not _window_ok(u):
+        return False, "UIA 树未就绪"
+    cur = (u.current_chat() or "")
+    if _chat_matches(cur, names):
+        return True, "已在当前会话（跳过点击）"
+    for n in names or []:
+        ok, why = open_chat_via_session_list(gui, n)
+        if ok:
+            return True, "列表点击"
+        last = why
+    return False, (last if names else "没有可点击的显示名")
+
+
 def send_multi_impl(get_gui, send_lock, db, texts, chat_username, chat_name,
                     gap: float = 1.0, verify: bool = True,
-                    self_id=None) -> tuple:
+                    self_id=None, names=None) -> tuple:
     """把若干条消息依次发给同一会话：只打开一次会话，之后连发。
 
     返回 (是否全部发出, 已发出的条数)。
@@ -1422,6 +1494,12 @@ def send_multi_impl(get_gui, send_lock, db, texts, chat_username, chat_name,
     ``verify=True``（默认）时每条发完回读数据库确认。**这不是多余的**：
     UI 路径只看「回车有没有按下去」，不看消息有没有真发出去——焦点丢了
     会静默只填不发，而上层一旦重试就会把已发出去的那句**再发一遍**（§7.20）。
+
+    2026-11-18 的改动（§7.39）：
+      * 目标会话**已经是当前会话**时，不再点会话列表（点已高亮的行＝关掉会话，
+        输入框会跟着没掉，只能重开）；
+      * 单条失败时先试着**把焦点交回输入框**重试，还不行才点会话列表，最后才搜索；
+      * ``names`` 可由调用方直接给（批量回复时已经解析过，省一次数据库查询）。
     """
     texts = [t for t in (texts or []) if (t or "").strip()]
     if not texts:
@@ -1431,12 +1509,9 @@ def send_multi_impl(get_gui, send_lock, db, texts, chat_username, chat_name,
         sent = 0
         try:
             gui = get_gui()
-            names = resolve_display_names(db, chat_username, chat_name)
-            opened, why = False, "没有可用的显示名"
-            for n in names:
-                opened, why = open_chat_via_session_list(gui, n)
-                if opened:
-                    break
+            names = [n for n in (names or []) if n] or \
+                resolve_display_names(db, chat_username, chat_name)
+            opened, why = _ensure_chat_open(get_gui, names)
             if not opened and not names:
                 # 昵称解析不出来（如私聊只拿到 wxid）：连搜索框这条路都走不通，
                 # 上游会白等 75s×3 次。提前放弃，把原因写清楚（§7.20）。
@@ -1445,17 +1520,56 @@ def send_multi_impl(get_gui, send_lock, db, texts, chat_username, chat_name,
                 return False, 0
             who = names[0] if names else (chat_name or chat_username)
             if opened:
-                via = "列表点击"
+                via = why if "已" in why else "列表点击"
             else:
                 via = f"搜索回退[{why}]"
 
             def _inject(text: str) -> tuple:
                 """注入一条 → (是否成功, resp 或错误文本)。异常在这里就地吞掉，交给重试。"""
                 try:
+                    # 会话已经确保了：传 None，别让 guia 再 open_chat 一遍（那是重复点击的来源）
                     resp = gui.send_msg(text, None if opened else who, False)
                     return _resp_ok(resp), resp
                 except Exception as e:  # noqa: BLE001
                     return False, f"{type(e).__name__}: {e}"
+
+            def _retry(text: str, mark) -> tuple:
+                """失败重试（按顺序、每步各试一次）：
+                ① 把焦点交回输入框直接重打——**不动会话**（2026-11-18 新增，用户要求）；
+                ② 还不行才点会话列表 / 走搜索；
+                ③ 如果会话本来已经是当前的，最后再补一次焦点重试。
+                """
+                tried_focus = False
+                try:
+                    u = get_gui()._get_uia()  # noqa: SLF001
+                except Exception:  # noqa: BLE001
+                    u = None
+                if u is not None and _focus_chat_input(u):
+                    tried_focus = True
+                    ok, resp = _inject(text)
+                    if ok and (not verify or _confirmed_sent(
+                            db, chat_username, text, mark, self_id)):
+                        log_line("  · 重设输入框焦点后重发成功（没点会话）")
+                        return True, resp
+                rwhy = "会话本来就是当前会话，跳过点击"
+                if not opened:
+                    reopened, rwhy = _ensure_chat_open(get_gui, names, u)
+                    if reopened:
+                        time.sleep(0.3)
+                        ok, resp = _inject(text)
+                        if ok and verify and not _confirmed_sent(
+                                db, chat_username, text, mark, self_id):
+                            ok, resp = False, f"重试后仍未确认（{_short(resp)}）"
+                        if ok:
+                            return True, resp
+                if not tried_focus and u is not None and _focus_chat_input(u):
+                    ok, resp = _inject(text)
+                    if ok and (not verify or _confirmed_sent(
+                            db, chat_username, text, mark, self_id)):
+                        log_line("  · 重设输入框焦点后重发成功（没点会话）")
+                        return True, resp
+                    rwhy = f"{rwhy}；焦点重试也没成"
+                return False, f"重试两次都失败（{rwhy}）"
 
             for i, text in enumerate(texts):
                 if not (opened or i == 0):
@@ -1470,21 +1584,9 @@ def send_multi_impl(get_gui, send_lock, db, texts, chat_username, chat_name,
                         log_line(f"[未确认] {chat_name}: 第{i + 1}/{len(texts)}条 UI 报成功，"
                                  f"但库里查不到，按未发出处理")
                 if not ok:
-                    # 失败重试一次：重开会话把焦点交回输入框（UIA，不碰剪贴板）。
-                    # 有水位门槛兜底，重发不会变成「同一句发两遍」。
                     log_line(f"[发送重试] {chat_name}: 第{i + 1}/{len(texts)}条失败（{_short(resp)}），"
-                             f"重开会话再试一次")
-                    reopened = False
-                    for n in names:
-                        reopened, _ = open_chat_via_session_list(gui, n)
-                        if reopened:
-                            break
-                    if reopened or opened:
-                        time.sleep(0.4)
-                        ok, resp = _inject(text)
-                        if ok and verify and not _confirmed_sent(
-                                db, chat_username, text, mark, self_id):
-                            ok, resp = False, f"重试后仍未确认（{_short(resp)}）"
+                             f"先重设焦点再试一次")
+                    ok, resp = _retry(text, mark)
                 log_line(f"{'[已发送]' if ok else '[发送异常]'} → {chat_name}: {text} "
                          f"| {via}{'' if len(texts) == 1 else f' 第{i + 1}/{len(texts)}条'} "
                          f"{time.time() - t0:.1f}s | resp={_short(resp)}")
@@ -1782,15 +1884,23 @@ def main():
             return True
         return do_send_impl(args, get_gui, send_lock, db, text, chat_username, chat_name)
 
-    def send_multi(texts, chat_username: str, chat_name: str) -> tuple:
-        """一次发多条（同一个会话只打开一次）。"""
+    def _disp_names(payload: dict) -> list:
+        """发送前解析一次会话显示名：批量回复时省掉每个会话重复解库（§7.39）。"""
+        try:
+            return resolve_display_names(db, payload["chat_username"], payload["chat_name"])
+        except Exception:  # noqa: BLE001
+            return []
+
+    def send_multi(texts, chat_username: str, chat_name: str, names=None) -> tuple:
+        """一次发多条（同一个会话只打开一次；会话已打开时连点击都省掉）。"""
         texts = [t for t in (texts or []) if (t or "").strip()]
         if args.dry_run:
             for t in texts:
                 log_line(f"[DRY-RUN] 本应发送「{chat_name}」: {t}")
             return True, len(texts)
         return send_multi_impl(get_gui, send_lock, db, texts, chat_username, chat_name,
-                               verify=send_verify, self_id=resolver.self_id)
+                               verify=send_verify, self_id=resolver.self_id,
+                               names=names)
 
     # --test-reply：模拟一条私信
     if args.test_reply:
@@ -1847,7 +1957,15 @@ def main():
               f"缓存目录={_ic.get('save_dir') or os.path.join(BASE_DIR, 'media')}）")
     else:
         print("看图：关（config.json → ai.image.enabled 打开后，机器人才能看到图片内容）")
+
     print(f"模式：{'DRY-RUN（不发送）' if args.dry_run else '正式（会真的发送）'}")
+    _bc0 = dict(cfg["ai"].get("batching") or {})
+    if _bc0.get("enabled"):
+        print(f"连发合并：开（同一人 {int(_bc0.get('wait_ms', 1200) or 1200)}ms 内连发多条 → "
+              f"合并成一次回复，最多 {int(_bc0.get('max_messages', 5) or 5)} 条，"
+              f"回复最多 {cfg['ai'].get('multi_send', {}).get('max_messages', 4)} 条）")
+    else:
+        print("连发合并：关（ai.batching.enabled=true 打开后，对方一口气发几条只回一次）")
     print(f"输入方式：{input_mode}")
     # 上游节奏层：档位决定写动作间隔/突发上限，误用默认档会莫名其妙等几十秒
     try:
@@ -1936,14 +2054,144 @@ def main():
         # 否则上游会重试 3 次（同一条消息触发 4 次回调）并最终丢弃该消息、
         # 推进水位 —— 表现为「同一条消息被记 4 次」+「后续私聊消息全收不到」（§7.22.2）
         try:
+            wait_ms = int(((cfg["ai"].get("batching") or {}).get("wait_ms", 0)) or 0)
+            if wait_ms > 0 and _enqueue_for_batch(msg, wait_ms):
+                return
             _on_msg_inner(msg, _lst)
         except Exception as e:  # noqa: BLE001
             log_line(f"[回调异常] {type(e).__name__}: {e}（msg.local_id={msg.get('local_id')}）")
             import traceback
             traceback.print_exc()
 
+    # ---- 连发合并（ai.batching，2026-11-18，§7.40）----------------------------
+    # 人打字经常一口气发三四条。以前每条都会各回一遍，现在：会话收到第一条后开一个
+    # 短窗口，窗口内同一个人再发就并进同一批，窗口结束再**统一回一次**。
+    # 三道闸：① 只有真正会触发回复的消息才开窗（不回的消息直接走老流程，不进队列）；
+    # ② 窗口内来的是别人或被回复失败，就先把这批立即冲掉；③ 队列满了/等太久一律冲掉，
+    # 绝不会让消息卡住不回。
+    _batch_lock = threading.RLock()
+    _batch_pending: dict = {}       # chat_username -> [msg, ...]（只装「还没处理」的）
+    _batch_timer: dict = {}         # chat_username -> threading.Timer
+
+    def _batch_cfg() -> dict:
+        bc = dict(cfg["ai"].get("batching") or {})
+        bc.setdefault("enabled", False)
+        bc.setdefault("wait_ms", 1200)
+        bc.setdefault("max_messages", 6)
+        bc.setdefault("max_chars", 0)
+        return bc
+
+    def _enqueue_for_batch(msg: dict, wait_ms: int) -> bool:
+        """排队并返回「已接管」；返回 False 表示这条应该走老流程（立即处理）。
+
+        判断「会不会触发回复」要花一次 policy.check（含可能的话题判定）：以前只在这条
+        消息**真的会回**时才开窗，不回的消息原样走老逻辑。但判定调用会花 token，
+        所以这里先用一个便宜的预筛（私聊 / 非群 / 被 @ / 喊名字 / 主动接话开着），
+        预筛通过才做真判定，判定为否就当场按老逻辑处理掉（不重复判定）。
+        """
+        if msg.get("is_self") or msg.get("_dsh_inner"):
+            return False                 # 自己发的 / 内部回放的消息，直接走老流程
+        bc = _batch_cfg()
+        chat = msg.get("chat_username") or ""
+        if not chat:
+            return False
+        with _batch_lock:
+            pend = _batch_pending.get(chat) or []
+            same = (not pend) or _same_sender(pend[0], msg)
+            if pend and not same:
+                # 换了个人说话：先把上一批冲掉，再单独给这条开窗
+                _flush_locked(chat, "换了人说话")
+                pend = []
+        # 真判定（与老流程同一套 policy.check，不额外花 token）
+        payload = build_payload(db, resolver, msg)
+        history = build_history(
+            db, resolver, payload["chat_username"],
+            int(cfg["ai"].get("history_limit", 8)), msg.get("local_id"),
+            max_age_minutes=int(cfg["ai"].get("history_max_age_minutes", 0) or 0),
+            max_tokens=int(cfg["ai"].get("history_max_tokens", 0) or 0),
+        )
+        ok, reason = policy.check(payload, history)
+        if not ok:
+            return False                 # 这条本来就不回：原样走老逻辑（会写「未回」日志）
+        with _batch_lock:
+            pend = _batch_pending.setdefault(chat, [])
+            pend.append(dict(msg, _dsh_history=history, _dsh_payload=payload))
+            _batch_timer.pop(chat, None)
+            t = threading.Timer(wait_ms / 1000.0, _flush_batch_later, args=(chat,))
+            t.daemon = True
+            _batch_timer[chat] = t
+            t.start()
+            print(f"  · 「{payload['chat_name']}」收到一条，等 {wait_ms}ms 看还有没有连发…",
+                  flush=True)
+            if len(pend) >= int(bc.get("max_messages", 6) or 6):
+                _flush_locked(chat, "凑够一批")
+
+    def _same_sender(a: dict, b: dict) -> bool:
+        return (a.get("sender_wxid") or "") == (b.get("sender_wxid") or "")
+
+    def _flush_locked(chat: str, why: str) -> None:
+        """把某会话攒着的一批立即处理掉（锁内调用）。"""
+        with _batch_lock:
+            t = _batch_timer.pop(chat, None)
+            if t is not None:
+                t.cancel()
+            batch = _batch_pending.pop(chat, None) or []
+        if batch:
+            log_line(f"[连发合并] {chat[:12]}…：{len(batch)} 条一起回（{why}）")
+
+        def _run():
+            try:
+                _process_batch(chat, batch, why)
+            except Exception as e:  # noqa: BLE001
+                log_line(f"[批量回复异常] {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
+
+        _run()
+
+    def _flush_batch_later(chat: str) -> None:
+        try:
+            _flush_locked(chat, "窗口结束")
+        except Exception as e:  # noqa: BLE001
+            log_line(f"[批量回复异常] {type(e).__name__}: {e}")
+
+    def _process_batch(chat: str, batch: list, why: str) -> None:
+        """一批连发改成一次调用：合成一段话交给模型，只发一次回复。"""
+        if not batch:
+            return
+        if len(batch) == 1:
+            _on_msg_inner(batch[0], lst)        # 只有一条 → 完全等同老行为
+            return
+        msgs = sorted(batch, key=lambda m: float(m.get("timestamp") or 0))
+        first, last = msgs[0], msgs[-1]
+        last["_dsh_batch_n"] = len(msgs)
+        bc = _batch_cfg()
+        cap = int(bc.get("max_chars", 0) or 0)
+        joined = []
+        for m in msgs:
+            t = str(m.get("content") or "").strip()
+            if not t:
+                continue
+            if m.get("type") and m.get("type") != "文本":
+                t = f"[{m.get('type')}]"
+            joined.append(t)
+        combined = "\n".join(joined)
+        if cap > 0 and len(combined) > cap:
+            combined = combined[:cap].rstrip() + "…"
+        merged = dict(last, content=combined, is_self=False)
+        # 上下文/图片沿用第一条那次算好的，别重复查库
+        merged["_dsh_history"] = first.get("_dsh_history")
+        merged["_dsh_payload"] = first.get("_dsh_payload")
+        print(f"  · 合并 {len(msgs)} 条后统一生成回复（{why}）", flush=True)
+        _on_msg_inner(merged, lst)
+
     def _on_msg_inner(msg: dict, _lst: Listener):
         payload = build_payload(db, resolver, msg)
+        # 批量合并时，payload / history 已经算过一遍（§7.40）：复用，别重复判定/查库
+        _ph = msg.get("_dsh_payload")
+        if _ph:
+            payload = dict(_ph)
+        _batch_n = int(msg.get("_dsh_batch_n") or 0)
         if not payload["is_self"]:
             # 停机补投的旧消息只进日志、不进 GUI：重启后几十上百条旧消息会以「现在」
             # 的事件时间插到新消息后面，对话流看着就乱序（§7.27）。新鲜度判据与
@@ -1953,8 +2201,12 @@ def main():
                       <= float(cfg["trigger"].get("max_age_seconds", 120) or 120))
             if _fresh:
                 policy._last_incoming[payload["chat_username"]] = time.time()
-                BUS.event("recv", chat=payload["chat_name"], sender=payload["sender"],
-                          text=(payload["content"] or "")[:80])
+                if _batch_n > 1:
+                    BUS.event("recv", chat=payload["chat_name"], sender=payload["sender"],
+                              text=f"（连发 {_batch_n} 条一起回）")
+                else:
+                    BUS.event("recv", chat=payload["chat_name"], sender=payload["sender"],
+                              text=(payload["content"] or "")[:80])
                 BUS.set_status(last_msg_time=time.time())
         # 图片消息：先取图（policy.check 要用它判断该不该回，生成回复时直接复用）
         local_id = msg.get("local_id")
@@ -1966,12 +2218,14 @@ def main():
                       f"（{len(policy.pending_image[0])//1024}KB {policy.pending_image[1]}）",
                       flush=True)
         # 上下文只取一次（排除刚收到的这条，别重复喂给模型）；三处判定/生成共用
-        history = build_history(
-            db, resolver, payload["chat_username"],
-            int(cfg["ai"].get("history_limit", 8)), msg.get("local_id"),
-            max_age_minutes=int(cfg["ai"].get("history_max_age_minutes", 0) or 0),
-            max_tokens=int(cfg["ai"].get("history_max_tokens", 0) or 0),
-        )
+        history = msg.get("_dsh_history")
+        if history is None:
+            history = build_history(
+                db, resolver, payload["chat_username"],
+                int(cfg["ai"].get("history_limit", 8)), msg.get("local_id"),
+                max_age_minutes=int(cfg["ai"].get("history_max_age_minutes", 0) or 0),
+                max_tokens=int(cfg["ai"].get("history_max_tokens", 0) or 0),
+            )
         ok, reason = policy.check(payload, history)
         unsolicited = False
         if not ok:
@@ -1993,6 +2247,12 @@ def main():
 
         ms = dict(cfg["ai"].get("multi_send") or {})
         me_name = info.get("nick_name") or ""
+        if _batch_n > 1:
+            # 连发合并（§7.40）：一次回完对方连着发的几句，条数按合并后的算
+            ms = dict(ms, max_messages=max(1, int(
+                (_batch_cfg().get("max_messages") or 0) or ms.get("max_messages", 4))))
+            log_line(f"[{payload['time']}] 连发 {_batch_n} 条 | "
+                     f"{payload['sender']}: {payload['content']}")
 
         if unsolicited:
             reply = unsolicited_fill(cfg["ai"], me_name, payload["chat_name"],
@@ -2013,7 +2273,8 @@ def main():
         policy.mark(payload["chat_username"], policy.sender_key(payload))
         if unsolicited:
             uns.mark(payload["chat_username"])
-        if send_multi(texts, payload["chat_username"], payload["chat_name"])[0]:
+        if send_multi(texts, payload["chat_username"], payload["chat_name"],
+                      names=_disp_names(payload))[0]:
             BUS.set_status(reply_count_today=BUS.status().get("reply_count_today", 0) + len(texts))
             # 异步更新记忆档案（不阻塞、不影响回复延迟）；群聊按 memory.group_enabled 拦掉
             _mcfg2 = cfg["ai"].get("memory", {}) or {}
