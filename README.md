@@ -8,7 +8,7 @@
 
 **v1.3.1（2026-11-18）主要变化**：
 - 🔧 **发送不再重复点会话**：目标会话已经打开就直接打字（微信 4.x 里点已高亮的会话行 = 关掉会话，输入框会跟着没）；单条失败时先「把焦点交回输入框」，还不行才点列表
-- ✅ **连发合并**：对方一口气发两三条时，合并成一段话**只回一次**（`ai.batching`，默认 1200ms 窗口、最多 5 条）
+- ✅ **连发合并**：对方一口气发两三条时，合并成一段话**只回一次**（`ai.batching`，默认 7 秒窗口、最多 8 条）
 - ⚡ **提示词放宽**：去掉「5～15 字」「三句上限」一堆硬限制，长短跟着话题走；口吻优先于「像人打字」，角色味道和红线都保留
 
 **v1.3.0（2026-11-17）**：
@@ -205,8 +205,8 @@ bot_gui.py (本地 HTTP 服务 + Edge 应用窗)
 | `ai.multi_send.mode` | `sentence` | `sentence` 一句一条 / `separator` 只按 `\|\|\|` 切 / 关 |
 | `ai.multi_send.max_messages` | `4` | 一次最多发几条 |
 | `ai.batching.enabled` | `true` | 连发合并：同一人短窗口内连发多条 → 合成一次回复 |
-| `ai.batching.wait_ms` | `1200` | 合并窗口（毫秒）；调大会等更久但合并得更多 |
-| `ai.batching.max_messages` | `5` | 一批最多合并几条、回复条数上限也按它放宽 |
+| `ai.batching.wait_ms` | `7000` | 合并窗口（毫秒，从最近一条算起）；调大会等更久但合并得更多 |
+| `ai.batching.max_messages` | `8` | 一批最多合并几条、回复条数上限也按它放宽 |
 | `ai.memory.max_facts` | `25` | 每个联系人的事实条数上限 |
 | `ai.memory.vector.enabled` | `true` | 长期向量记忆（依赖 mem0 + fastembed） |
 | `ai.memory.vector.infer` | `false` | `true` = 让 mem0 额外调模型做事实抽取（更贵） |

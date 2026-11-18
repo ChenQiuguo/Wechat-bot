@@ -59,11 +59,11 @@ import wx_bot  # noqa: E402
 cfg = wx_bot.load_config(wx_bot.CONFIG_PATH)
 bc = dict(cfg["ai"].get("batching") or {})
 case("④ 本机配置里 batching 已开启", bc.get("enabled") is True, repr(bc))
-case("⑤ 等待窗口在 0.5–3 秒之间（不影响正常对话节奏）",
-     500 <= int(bc.get("wait_ms", 0)) <= 3000, repr(bc))
+case("⑤ 等待窗口在 5–10 秒之间（2026-11-18：用户要求至少 7 秒）",
+     5000 <= int(bc.get("wait_ms", 0)) <= 10000, repr(bc))
 mx = int(bc.get("max_messages", 0) or 0)
-case("⑥ 一次最多合并 3–6 条，且回复条数上限 >= 3",
-     mx <= 6 and int(cfg["ai"]["multi_send"].get("max_messages", 0)) >= 3,
+case("⑥ 一次最多合并 6–10 条，且回复条数上限 >= 3",
+     mx <= 10 and int(cfg["ai"]["multi_send"].get("max_messages", 0)) >= 3,
      f"batching.max_messages={mx} multi_send.max_messages="
      f"{cfg['ai']['multi_send'].get('max_messages')}")
 
@@ -85,11 +85,11 @@ def dedupe(seq, window):
     return [len(b) for b in batches]
 
 
-sizes = dedupe([(0, "A"), (0.3, "A"), (0.7, "A")], 1.2)
-case("⑦ 同一人 1.2s 内三条 → 一批 3 条", sizes == [3], str(sizes))
-sizes = dedupe([(0, "A"), (0.3, "A"), (1.5, "A")], 1.2)
+sizes = dedupe([(0, "A"), (0.3, "A"), (0.7, "A")], 7)
+case("⑦ 同一人 7 秒内三条 → 一批 3 条", sizes == [3], str(sizes))
+sizes = dedupe([(0, "A"), (0.3, "A"), (8.0, "A")], 7)
 case("⑧ 间隔超过窗口 → 分成两批", sizes == [2, 1], str(sizes))
-sizes = dedupe([(0, "A"), (0.3, "B")], 1.2)
+sizes = dedupe([(0, "A"), (0.3, "B")], 7)
 case("⑨ 中途换了人 → 上一批立刻冲掉、各回一次", sizes == [1, 1], str(sizes))
 
 print()
