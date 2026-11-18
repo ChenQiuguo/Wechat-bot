@@ -1315,6 +1315,21 @@ def parse_multi(raw, separator: str = "|||", max_parts: int = 0) -> list:
         parts = head
     return parts
 
+def is_silence(raw) -> bool:
+    """这条回复是不是「这次干脆不回」（提示词里约定：整个回复只输出 [SKIP]）。
+
+    2026-11-18 用户要求：让 AI 自己判断这个话题值不值得回（敏感话题、对方明说别回、
+    错发/广告、群里已有人答……），不想回就直接沉默。这里认三种写法：
+    纯 ``[SKIP]``、``【SKIP】``、以及包了引号/空白/句号的同一件事；**只认整条**——
+    正文里提到「SKIP」不算（免得把正常回复吃掉）。
+    """
+    t = (raw or "").strip()
+    if not t:
+        return False
+    t = t.strip("「」\"'“”‘’ \t\r\n。.~～")
+    return t.upper() in ("[SKIP]", "【SKIP】", "SKIP", "［SKIP］")
+
+
 def split_for_send(raw: str, msc: dict) -> list:
     """按配置把一段回复切成要分开发的几条。
 
@@ -1957,6 +1972,9 @@ def main():
               f"缓存目录={_ic.get('save_dir') or os.path.join(BASE_DIR, 'media')}）")
     else:
         print("看图：关（config.json → ai.image.enabled 打开后，机器人才能看到图片内容）")
+    print("AI 自主沉默：" + ("开（话题不该接时她会只输出 [SKIP]，程序就不发）"
+                         if bool((cfg["ai"].get("silence") or {}).get("enabled", True))
+                         else "关"))
 
     print(f"模式：{'DRY-RUN（不发送）' if args.dry_run else '正式（会真的发送）'}")
     _bc0 = dict(cfg["ai"].get("batching") or {})
@@ -2267,6 +2285,15 @@ def main():
                              images=[policy.pending_image] if policy.pending_image else None)
         if not reply:
             log_line("  AI 未生成回复，跳过")
+            return
+        # 2026-11-18：AI 自己判断这次不回（敏感话题 / 对方明说别回 / 错发广告…）。
+        # 直接沉默——不发空消息、不写记忆、不打冷却（下次该回的时候不受影响）。
+        if is_silence(reply) and bool((cfg["ai"].get("silence") or {}).get("enabled", True)):
+            log_line(f"[{payload['time']}] 选择不回 {payload['chat_name']} | "
+                     f"{payload['sender']}: {(payload['content'] or '')[:40]}"
+                     f" | 原因：AI 判断这个话题不必接")
+            BUS.event("system", chat=payload["chat_name"],
+                      text=f"AI 选择不回（{payload['sender']}）：{(payload['content'] or '')[:40]}")
             return
         # 一句一条发（模式见 ai.multi_send）；想整段一条就把 enabled 关掉
         texts = split_for_send(reply, ms)
